@@ -1,0 +1,20 @@
+{
+  "baseline-concurrent-explorer-summary.png": "f0b72abd25077228953a42e5751b8c9f29471d2628c11f752325e35cc440475c",
+  "baseline-concurrent-explorer-tokens.png": "5bab4ccfc3d947241a6bab0acd14d512191d36fce834aeb4d879bb85b8884665",
+  "baseline-concurrent-ledger.json": "1ebd52eb37af93179af986470ec0c7932ba12dba616e1b57194a0c30180a01b1",
+  "baseline-sequential-ledger.json": "58f268cc8095cfc0cf892973ea3a8e2a304206da9295110333b98ff1e75f5d7a",
+  "go-x402-adapter-race-with-http.jsonl": "76ad4b6e785a31e84a0b34dd4c473e66c5d345b4dd6651a1dd2b583f32269d63",
+  "go-x402-devnet-baseline-concurrent.jsonl": "2880bddb44bd98279d996b4fc52481529117431b4acd446203b6a226f960ed71",
+  "go-x402-devnet-baseline-sequential.jsonl": "86979276fb03df32cd0ad8815490087a4f70b624df18ba025edc5bb8e158c77f",
+  "go-x402-devnet-patched-concurrent.jsonl": "443a6994e0febd3ce521d8faa65cbcf283e7959ce053050b9f46ca76e1fec361",
+  "go-x402-devnet-patched-sequential.jsonl": "77e90f4d7251b905fca0735168979e532fd7bedce4be220f57bcf868a6456c31",
+  "go-x402-http-offline-baseline.jsonl": "bfec9f7f6273ae11b0b3e8e0823f8a93a62816d88bf02eef3cc525a60140a431",
+  "go-x402-http-offline-patched.jsonl": "955390a2b7ee6d4bd591efa6669180d3562f1b0a332a84f7f42122616ae1dbff",
+  "http-and-ledger-summary.png": "899235b6db470061071f61f0dd9e579215fbd977a984ae7020244764fa77150a",
+  "patched-concurrent-explorer-summary.png": "f8b489b974a285b3c7b7951f4316a637c19c545b8b1648800b6a3b4400d85273",
+  "patched-concurrent-explorer-tokens.png": "49b281ed5938f4292e3c74891344e885eba5c94b6f91775dfb9c3e2bdac6325b",
+  "patched-concurrent-ledger.json": "5eb92c7a2a84936a1db5d99780bfb9de64c9560973b80731662af3b967a3718f",
+  "patched-sequential-ledger.json": "683d2cf338579cc3eed5466d97075c38594ecd465c8a6929aa9a43ccb79a3785",
+  "report.html": "ae4a0db55c7be50770b1ebfac1053e954c9a913bd98382a71759e2bbb9491aba",
+  "report.json": "833568a7725f61b12520e86af2a064d1d4cc9059dd136daf2db131ea7a93628a"
+}

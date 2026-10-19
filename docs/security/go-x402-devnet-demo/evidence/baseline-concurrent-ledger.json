@@ -1,0 +1,115 @@
+{
+  "slot": 512907896,
+  "blockTime": 1792439095,
+  "transaction": [
+    "Arxx2snn81d8yjc45T93/Qjyvcax4cZnP+6Kqo9OwWaNj723bGrG1iV72915ivTqbAbzoBWnNJ+ptn53im2r6w/bHFr+iUCOGUnxMPCNfWcyZ+SXJeC3zl227JDjrb+Y/VHcAACOk8xKj+pWicaQXWzJb61OP3ZpbTgyWMv5M3oOgAIBBAiYHpzC42UB00OQibJVi4RJq/XFOu4cpd6hiOPuqG1fdIuiNtUZH68me24WyHjHcXJRperVD5kXFoUzQlb6VuafAaERYpKeZ/zRC19kbnkQ+1n/1C/oYDQf2c77FAqCavume33PJlyuuz7gRDywNkx07VoXdZRXARJCr+lBaKu2UQMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0G3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8Aqd+v4vz4XgJMl5IJiBxLTQMaE+NTGYIxQnawcCQub4m3G+OzJhbJg1KBVcNvqkaNJ29tBlnW6attB0fi4TIUWhQEBAAFAiBOAAAEAAkDAQAAAAAAAAAGBAMHAgEKDOgDAAAAAAAABgUAMWRpc3Bvc2FibGUgRGV2bmV0IHJlcGxheSBkZW1vIGJhc2VsaW5lIGNvbmN1cnJlbnQA",
+    "base64"
+  ],
+  "meta": {
+    "err": null,
+    "fee": 10001,
+    "preBalances": [
+      4995936319,
+      0,
+      1488440,
+      1488440,
+      1,
+      41509619334,
+      20381277856,
+      1066800
+    ],
+    "postBalances": [
+      4995926318,
+      0,
+      1488440,
+      1488440,
+      1,
+      41509619334,
+      20381277856,
+      1066800
+    ],
+    "innerInstructions": [],
+    "preTokenBalances": [
+      {
+        "accountIndex": 2,
+        "owner": "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "1000",
+          "decimals": 6,
+          "uiAmount": 0.001,
+          "uiAmountString": "0.001"
+        }
+      },
+      {
+        "accountIndex": 3,
+        "owner": "AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "999000",
+          "decimals": 6,
+          "uiAmount": 0.999,
+          "uiAmountString": "0.999"
+        }
+      }
+    ],
+    "postTokenBalances": [
+      {
+        "accountIndex": 2,
+        "owner": "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "2000",
+          "decimals": 6,
+          "uiAmount": 0.002,
+          "uiAmountString": "0.002"
+        }
+      },
+      {
+        "accountIndex": 3,
+        "owner": "AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "998000",
+          "decimals": 6,
+          "uiAmount": 0.998,
+          "uiAmountString": "0.998"
+        }
+      }
+    ],
+    "logMessages": [
+      "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+      "Program ComputeBudget111111111111111111111111111111 success",
+      "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+      "Program ComputeBudget111111111111111111111111111111 success",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [1]",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 105 of 19700 compute units",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr invoke [1]",
+      "Program log: Memo (len 49): \"disposable Devnet replay demo baseline concurrent\"",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr consumed 18973 of 19595 compute units",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr success"
+    ],
+    "status": {
+      "Ok": null
+    },
+    "rewards": [],
+    "loadedAddresses": {
+      "readonly": [],
+      "writable": []
+    },
+    "returnData": {
+      "programId": "11111111111111111111111111111111",
+      "data": [
+        "",
+        ""
+      ]
+    },
+    "computeUnitsConsumed": 19378
+  },
+  "version": 0
+}

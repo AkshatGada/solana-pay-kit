@@ -1,0 +1,115 @@
+{
+  "slot": 512907809,
+  "blockTime": 1792439074,
+  "transaction": [
+    "AhGY/a9x9bL4Fxd3YFiZ9xMUDnnDqLHT0D6ChOb64/792XVxO9T4OkGQrifZ9vYFoHxpBKCx4zyW8WudkTDmDwTdUchBj1X9fF2fn2Z+K/W1CbTt5FEyiXvzSZ7oCuKMlA9qXvvkIAIfkVsaxnXS9W0y8cG4xm5PA5G/V8JtzrMIgAIBBAiYHpzC42UB00OQibJVi4RJq/XFOu4cpd6hiOPuqG1fdIuiNtUZH68me24WyHjHcXJRperVD5kXFoUzQlb6VuafAaERYpKeZ/zRC19kbnkQ+1n/1C/oYDQf2c77FAqCavume33PJlyuuz7gRDywNkx07VoXdZRXARJCr+lBaKu2UQMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0G3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8Aqd+v4vz4XgJMl5IJiBxLTQMaE+NTGYIxQnawcCQub4m3AX1Nzk+RBH+Krt2NuykAAXdfngwBAMA9MfHUBZvsUosEBAAFAiBOAAAEAAkDAQAAAAAAAAAGBAMHAgEKDOgDAAAAAAAABgUAMWRpc3Bvc2FibGUgRGV2bmV0IHJlcGxheSBkZW1vIGJhc2VsaW5lIHNlcXVlbnRpYWwA",
+    "base64"
+  ],
+  "meta": {
+    "err": null,
+    "fee": 10001,
+    "preBalances": [
+      4995946320,
+      0,
+      1488440,
+      1488440,
+      1,
+      41509619334,
+      20381277856,
+      1066800
+    ],
+    "postBalances": [
+      4995936319,
+      0,
+      1488440,
+      1488440,
+      1,
+      41509619334,
+      20381277856,
+      1066800
+    ],
+    "innerInstructions": [],
+    "preTokenBalances": [
+      {
+        "accountIndex": 2,
+        "owner": "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "0",
+          "decimals": 6,
+          "uiAmount": null,
+          "uiAmountString": "0"
+        }
+      },
+      {
+        "accountIndex": 3,
+        "owner": "AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "1000000",
+          "decimals": 6,
+          "uiAmount": 1,
+          "uiAmountString": "1"
+        }
+      }
+    ],
+    "postTokenBalances": [
+      {
+        "accountIndex": 2,
+        "owner": "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "1000",
+          "decimals": 6,
+          "uiAmount": 0.001,
+          "uiAmountString": "0.001"
+        }
+      },
+      {
+        "accountIndex": 3,
+        "owner": "AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC",
+        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+        "uiTokenAmount": {
+          "amount": "999000",
+          "decimals": 6,
+          "uiAmount": 0.999,
+          "uiAmountString": "0.999"
+        }
+      }
+    ],
+    "logMessages": [
+      "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+      "Program ComputeBudget111111111111111111111111111111 success",
+      "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+      "Program ComputeBudget111111111111111111111111111111 success",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [1]",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 105 of 19700 compute units",
+      "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr invoke [1]",
+      "Program log: Memo (len 49): \"disposable Devnet replay demo baseline sequential\"",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr consumed 18973 of 19595 compute units",
+      "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr success"
+    ],
+    "status": {
+      "Ok": null
+    },
+    "rewards": [],
+    "loadedAddresses": {
+      "readonly": [],
+      "writable": []
+    },
+    "returnData": {
+      "programId": "11111111111111111111111111111111",
+      "data": [
+        "",
+        ""
+      ]
+    },
+    "computeUnitsConsumed": 19378
+  },
+  "version": 0
+}

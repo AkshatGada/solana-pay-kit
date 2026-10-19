@@ -1,0 +1,121 @@
+{
+  "date_local": "2026-10-20",
+  "timezone": "Asia/Kolkata",
+  "network": "public Solana Devnet",
+  "base_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "asset": "fresh disposable SPL test token, 6 decimals; no real USDC or real SOL",
+  "mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+  "rpc_transaction_preflight_enabled": true,
+  "mechanism": "Client-only and fully signed representations co-sign to identical wire bytes. Baseline reservations use different signer identities; patched reservations use the primary signature from post-cosign bytes.",
+  "results": [
+    {
+      "variant": "baseline",
+      "scenario": "sequential",
+      "transaction": "MQZoYySA5wpJFa6s6fdN3yUkC5DUoiAzaAuBCXw8M96uosfRzT8QuJgF2ickPRuGFND2m284u3FbSKMXVUafEQT",
+      "explorer": "https://explorer.solana.com/tx/MQZoYySA5wpJFa6s6fdN3yUkC5DUoiAzaAuBCXw8M96uosfRzT8QuJgF2ickPRuGFND2m284u3FbSKMXVUafEQT?cluster=devnet",
+      "paid_handler_invocations": 1,
+      "rpc_send_calls": 2,
+      "client_before": "1000000",
+      "client_after": "999000",
+      "merchant_before": "0",
+      "merchant_after": "1000",
+      "ledger_slot": 512907809,
+      "http_statuses": [
+        200,
+        402
+      ],
+      "ledger_transferred_base_units": 1000,
+      "rejection_codes": [
+        "send_failed"
+      ]
+    },
+    {
+      "variant": "baseline",
+      "scenario": "concurrent",
+      "transaction": "4mXFi4rdyFn4BUpuzXTiJ8yovBpoauEwjPys2btCoEhqgBGGuyHPDyM8DMyYmEwZ4SFPZFophHHtfMFRWAs3aVuG",
+      "explorer": "https://explorer.solana.com/tx/4mXFi4rdyFn4BUpuzXTiJ8yovBpoauEwjPys2btCoEhqgBGGuyHPDyM8DMyYmEwZ4SFPZFophHHtfMFRWAs3aVuG?cluster=devnet",
+      "paid_handler_invocations": 2,
+      "rpc_send_calls": 2,
+      "client_before": "999000",
+      "client_after": "998000",
+      "merchant_before": "1000",
+      "merchant_after": "2000",
+      "ledger_slot": 512907896,
+      "http_statuses": [
+        200,
+        200
+      ],
+      "ledger_transferred_base_units": 1000,
+      "rejection_codes": []
+    },
+    {
+      "variant": "patched",
+      "scenario": "sequential",
+      "transaction": "3XrLZQnrKE5kXFtFp93YEssc5cZxEthJEczShLdXZ7GGzUZDETX2sduMydZ7F5WcdRBTHXPshTwa44XFpdbGZkdi",
+      "explorer": "https://explorer.solana.com/tx/3XrLZQnrKE5kXFtFp93YEssc5cZxEthJEczShLdXZ7GGzUZDETX2sduMydZ7F5WcdRBTHXPshTwa44XFpdbGZkdi?cluster=devnet",
+      "paid_handler_invocations": 1,
+      "rpc_send_calls": 1,
+      "client_before": "998000",
+      "client_after": "997000",
+      "merchant_before": "2000",
+      "merchant_after": "3000",
+      "ledger_slot": 512907940,
+      "http_statuses": [
+        200,
+        402
+      ],
+      "ledger_transferred_base_units": 1000,
+      "rejection_codes": [
+        "signature_consumed"
+      ]
+    },
+    {
+      "variant": "patched",
+      "scenario": "concurrent",
+      "transaction": "4yjKjBpRHGFEGdudrHGCnTAijGLVyjHXGP77egAQTHZBUQiKSZKySk7G9x1PHA3mrj27G1T6GUJzLZSW3u832qez",
+      "explorer": "https://explorer.solana.com/tx/4yjKjBpRHGFEGdudrHGCnTAijGLVyjHXGP77egAQTHZBUQiKSZKySk7G9x1PHA3mrj27G1T6GUJzLZSW3u832qez?cluster=devnet",
+      "paid_handler_invocations": 1,
+      "rpc_send_calls": 1,
+      "client_before": "997000",
+      "client_after": "996000",
+      "merchant_before": "3000",
+      "merchant_after": "4000",
+      "ledger_slot": 512908024,
+      "http_statuses": [
+        402,
+        200
+      ],
+      "ledger_transferred_base_units": 1000,
+      "rejection_codes": [
+        "signature_consumed"
+      ]
+    }
+  ],
+  "findings": [
+    "Concurrent Devnet baseline: one ledger transfer, two successful HTTP responses and paid-handler invocations.",
+    "Concurrent patched: one ledger transfer, one successful response, one signature_consumed rejection before a second RPC submission.",
+    "Sequential baseline: second submission blocked by real Devnet preflight AlreadyProcessed; adapter reports send_failed. Patched rejects earlier as signature_consumed."
+  ],
+  "limits": [
+    "One concurrent pair per variant observed; scheduling and public RPC behavior can vary.",
+    "Replay markers remain process-local; restart/multi-instance persistence is not supplied by this patch.",
+    "Explorer screenshots establish ledger facts; local HTTP logs establish handler access. Neither alone proves both.",
+    "Offline HTTP logs use simulated RPC and are separately labeled.",
+    "The fully signed representation was deliberately prepared with the disposable operator key. This tests replay handling when both valid representations are available; it does not establish that an untrusted client can obtain the operator-signed form before the first submission or confirmation.",
+    "The original harness reported boot preflight enabled, but did not capture PAY_KIT_DISABLE_PREFLIGHT. Boot preflight is not independently established by that flag; transaction preflight is established by the recorded skipPreflight=false RPC options. The reproduction script now clears the inherited override."
+  ],
+  "private_keys": "Stored outside repository and excluded from all evidence.",
+  "sources_sha256": {
+    "docs/security/go-x402-devnet-demo/main.go": "1b6c82d9fbd55886e562d90db05635db1658d1e1094dc42c3c37796c506a1a0a",
+    "go/paykit/adapters/x402/exact.go": "a0d23deb32f87c9c8392732c296076c03d90d116080e05a4be259fc2301cb713",
+    "go/paykit/adapters/x402/replay_http_test.go": "4373486d76cab2564785d3a4394fb5c18d3bedb78c541f9df8c0d342f031b134"
+  },
+  "latest_adapter_race_suite": {
+    "passed_tests_and_subtests": 115,
+    "failed": 0,
+    "short": true,
+    "race": true
+  },
+  "server_boot_preflight_reported_enabled": true,
+  "server_boot_preflight_enabled": null
+}
