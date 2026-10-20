@@ -485,12 +485,18 @@ func validateOpenSigningPolicy(tx *solana.Transaction, expected VerifyOpenTxExpe
 		programID = *expected.ProgramID
 	}
 	foundOpen := false
+	var seenBudget [256]bool
 	for _, ix := range tx.Message.Instructions {
 		program, err := resolveProgramID(tx, ix.ProgramIDIndex)
 		if err != nil {
 			return err
 		}
 		if program.Equals(computeBudgetProgramID) {
+			// The shared validator above has checked the operation and encoding.
+			if seenBudget[ix.Data[0]] {
+				return fmt.Errorf("open transaction contains duplicate compute budget operation %d", ix.Data[0])
+			}
+			seenBudget[ix.Data[0]] = true
 			continue
 		}
 		if foundOpen || !program.Equals(programID) || len(ix.Data) == 0 || ix.Data[0] != openInstructionDiscriminator {

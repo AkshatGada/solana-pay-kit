@@ -7,11 +7,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	bin "github.com/gagliardetto/binary"
 	solana "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/solana-foundation/pay-kit/go/paycore/paymentchannels"
 	"github.com/solana-foundation/pay-kit/go/paycore/solanatx"
 	"github.com/solana-foundation/pay-kit/go/protocols/mpp/intents"
+	pcgen "github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels"
 )
 
 var errOfflineSigningBoundary = errors.New("offline probe: signature intentionally withheld")
@@ -316,6 +319,45 @@ func TestSessionCosigningAllowsCappedBudgetAroundOpen(t *testing.T) {
 	}
 }
 
+func TestSessionCosigningRejectsDuplicateBudgetOperations(t *testing.T) {
+	for _, budget := range []struct {
+		name          string
+		first, second []byte
+	}{
+		{"identical-limit", encodeUnitLimit(100_000), encodeUnitLimit(100_000)},
+		{"different-limit", encodeUnitLimit(100_000), encodeUnitLimit(200_000)},
+		{"zero-limit", encodeUnitLimit(0), encodeUnitLimit(0)},
+		{"identical-price", encodeUnitPrice(5_000), encodeUnitPrice(5_000)},
+		{"different-price", encodeUnitPrice(5_000), encodeUnitPrice(10_000)},
+		{"zero-price", encodeUnitPrice(0), encodeUnitPrice(0)},
+	} {
+		for _, legacy := range []bool{false, true} {
+			for _, entry := range []string{"direct", "public-method"} {
+				for _, position := range []string{"before", "around", "after"} {
+					t.Run(fmt.Sprintf("%s/legacy=%v/%s/%s", budget.name, legacy, entry, position), func(t *testing.T) {
+						f, signer, rpcClient := buildOfflineSessionOpen(t, legacy, func(open solana.Instruction, _ solana.PublicKey) []solana.Instruction {
+							first := solana.NewInstruction(computeBudgetProgramID, nil, budget.first)
+							second := solana.NewInstruction(computeBudgetProgramID, nil, budget.second)
+							switch position {
+							case "before":
+								return []solana.Instruction{first, second, open}
+							case "after":
+								return []solana.Instruction{open, first, second}
+							default:
+								return []solana.Instruction{first, open, second}
+							}
+						})
+						err := invokeOfflineSessionOpen(t, entry, f, signer, rpcClient)
+						if err == nil || !strings.Contains(err.Error(), "duplicate compute budget") || signer.calls != 0 || rpcClient.sendAttempts != 0 {
+							t.Fatalf("duplicate budget: signing=%d sends=%d err=%v", signer.calls, rpcClient.sendAttempts, err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 func TestSessionCosigningRejectsOtherProgramsAndChannelOperations(t *testing.T) {
 	programs := map[string]solana.PublicKey{
 		"system":                    solana.SystemProgramID,
@@ -382,6 +424,46 @@ func TestSessionCosigningRejectsOutOfRangeProgramIndex(t *testing.T) {
 	}
 }
 
+// Keep the positive signing cases funded when confirmed-channel validation is
+// enabled too. This fixture is independent of the confirmed-channel PR's tests.
+type cosigningChannelRPC struct {
+	*testutil.FakeRPC
+	channel solana.PublicKey
+	account *rpc.Account
+}
+
+func (r *cosigningChannelRPC) GetAccountInfoWithOpts(ctx context.Context, account solana.PublicKey, opts *rpc.GetAccountInfoOpts) (*rpc.GetAccountInfoResult, error) {
+	if !account.Equals(r.channel) {
+		return r.FakeRPC.GetAccountInfoWithOpts(ctx, account, opts)
+	}
+	return &rpc.GetAccountInfoResult{Value: r.account}, nil
+}
+
+func newCosigningChannelRPC(t *testing.T, f openTxFixture) *cosigningChannelRPC {
+	t.Helper()
+	_, bump, err := paymentchannels.FindChannelPDA(f.payer.PublicKey(), f.payee, f.mint, f.authorized, openFixtureSalt, openFixtureOpenSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := pcgen.Channel{
+		// The IDL assigns channel = 1; the generated discriminator enum omits
+		// explicit values and must not be used for the account's wire header.
+		Discriminator: 1, Version: 1, Bump: bump, Status: uint8(pcgen.ChannelStatus_Open),
+		Salt: openFixtureSalt, Deposit: openFixtureDeposit, GracePeriod: openFixtureGrace,
+		DistributionHash: sha256.Sum256([]byte{0, 0, 0, 0}), Payer: f.payer.PublicKey(),
+		Payee: f.payee, Mint: f.mint, AuthorizedSigner: f.authorized, RentPayer: f.payer.PublicKey(),
+		OpenSlot: openFixtureOpenSlot,
+	}
+	var data bytes.Buffer
+	if err := channel.MarshalWithEncoder(bin.NewBorshEncoder(&data)); err != nil {
+		t.Fatal(err)
+	}
+	return &cosigningChannelRPC{
+		FakeRPC: testutil.NewFakeRPC(), channel: f.channel,
+		account: &rpc.Account{Owner: paymentchannels.ProgramPubkey(), Data: rpc.DataBytesOrJSONFromBytes(data.Bytes())},
+	}
+}
+
 func TestSessionCosigningPriceCapDependsOnSigner(t *testing.T) {
 	for _, sponsored := range []bool{false, true} {
 		for _, price := range []uint64{10_000, 10_001, 5_000_000, 5_000_001} {
@@ -414,7 +496,7 @@ func TestSessionCosigningPriceCapDependsOnSigner(t *testing.T) {
 						signer = f.payer
 					}
 				}
-				fake := testutil.NewFakeRPC()
+				fake := newCosigningChannelRPC(t, f)
 				result, err := SubmitOpenTx(context.Background(), f.expected, &f.payload, signer, fake)
 				if price <= cap {
 					if err != nil || len(fake.Sent) != 1 || result.Signature != tx.Signatures[0].String() {
