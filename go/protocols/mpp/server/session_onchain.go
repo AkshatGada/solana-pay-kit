@@ -465,9 +465,50 @@ type SubmitOpenTxResult struct {
 	Signature string
 }
 
+// validateOpenSigningPolicy checks the entire message before an operator signs
+// it. Like Rust's session prepare_open_transaction, the only permitted wrappers
+// around one channel open are decoded, cap-bounded ComputeBudget instructions.
+// EfeDurmaz16's earlier PR239 proposed the single-open restriction; validating
+// compute wrappers preserves Rust-compatible fee tuning without extra actions.
+func validateOpenSigningPolicy(tx *solana.Transaction, expected VerifyOpenTxExpected, payerSigner solanatx.Signer) error {
+	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0].String() != expected.Operator {
+		return fmt.Errorf("open transaction fee payer must match the configured operator")
+	}
+	if payerSigner != nil && !payerSigner.PublicKey().Equals(tx.Message.AccountKeys[0]) {
+		return fmt.Errorf("open signer must match the configured operator fee payer")
+	}
+	if err := validateComputeBudgetInstructions(tx, payerSigner != nil); err != nil {
+		return fmt.Errorf("open compute budget: %w", err)
+	}
+	programID := paymentchannels.ProgramPubkey()
+	if expected.ProgramID != nil {
+		programID = *expected.ProgramID
+	}
+	foundOpen := false
+	for _, ix := range tx.Message.Instructions {
+		program, err := resolveProgramID(tx, ix.ProgramIDIndex)
+		if err != nil {
+			return err
+		}
+		if program.Equals(computeBudgetProgramID) {
+			continue
+		}
+		if foundOpen || !program.Equals(programID) || len(ix.Data) == 0 || ix.Data[0] != openInstructionDiscriminator {
+			return fmt.Errorf("open transaction contains an unexpected instruction")
+		}
+		foundOpen = true
+	}
+	if !foundOpen {
+		return fmt.Errorf("open transaction does not contain an open instruction")
+	}
+	return nil
+}
+
 // SubmitOpenTx validates a client-built payment-channel open transaction,
 // completes the fee-payer signature when payerSigner is required by the
 // transaction, broadcasts it, and waits for at least confirmed commitment.
+// Before signing, it requires one open plus validated ComputeBudget wrappers,
+// with the fee payer and any signing key pinned to the configured operator.
 // Callers must not persist channel state for a transaction that never
 // landed. Used when the session is configured with the server open-tx
 // submitter.
@@ -483,6 +524,9 @@ func SubmitOpenTx(ctx context.Context, expected VerifyOpenTxExpected, payload *i
 	}
 	tx, err := decodeOpenTransaction(*payload.Transaction)
 	if err != nil {
+		return SubmitOpenTxResult{}, err
+	}
+	if err := validateOpenSigningPolicy(tx, expected, payerSigner); err != nil {
 		return SubmitOpenTxResult{}, err
 	}
 	// Complete the fee-payer signature when the client left the slot for the
