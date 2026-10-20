@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -283,7 +282,9 @@ func transactionAlreadyProcessed(err error) bool {
 			return true
 		}
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "already been processed")
+	// Error text may include client-chosen memo/program logs. Only the
+	// structured transaction error proves this was a consumed signature.
+	return false
 }
 
 func (a *Adapter) verifyLegacyBinding(gate *paykit.Gate, credential *proto.Credential) error {

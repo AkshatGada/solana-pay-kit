@@ -239,8 +239,6 @@ func TestReplayIdentityReservedWhileBroadcastPending(t *testing.T) {
 
 func TestReplayAlreadyProcessedRemainsConsumed(t *testing.T) {
 	for name, sendErr := range map[string]error{
-		"plain":              errors.New("Transaction simulation failed: This transaction has already been processed"),
-		"wrapped":            fmt.Errorf("broadcast: %w", errors.New("THIS TRANSACTION HAS ALREADY BEEN PROCESSED")),
 		"structured":         &jsonrpc.RPCError{Code: -32002, Message: "Transaction simulation failed", Data: map[string]any{"err": "AlreadyProcessed"}},
 		"wrapped-structured": fmt.Errorf("broadcast: %w", &jsonrpc.RPCError{Code: -32002, Message: "Transaction simulation failed", Data: map[string]any{"err": "AlreadyProcessed"}}),
 	} {
@@ -278,8 +276,15 @@ func TestReplayAcceptedBroadcastRemainsConsumed(t *testing.T) {
 
 func TestReplaySendFailureCanRetry(t *testing.T) {
 	for name, sendErr := range map[string]error{
-		"transport": context.DeadlineExceeded,
-		"preflight": &jsonrpc.RPCError{Code: -32002, Message: "Transaction simulation failed", Data: map[string]any{"err": "BlockhashNotFound"}},
+		"transport":           context.DeadlineExceeded,
+		"preflight":           &jsonrpc.RPCError{Code: -32002, Message: "Transaction simulation failed", Data: map[string]any{"err": "BlockhashNotFound"}},
+		"plain replay text":   errors.New("Transaction simulation failed: This transaction has already been processed"),
+		"wrapped replay text": fmt.Errorf("broadcast: %w", errors.New("THIS TRANSACTION HAS ALREADY BEEN PROCESSED")),
+		"client-chosen log": &jsonrpc.RPCError{Code: -32002, Message: "Transaction simulation failed", Data: map[string]any{
+			"err":  map[string]any{"InstructionError": []any{1, map[string]any{"Custom": 1}}},
+			"logs": []string{"Program log: Memo: This transaction has already been processed"},
+		}},
+		"message only": &jsonrpc.RPCError{Code: -32002, Message: "This transaction has already been processed"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			a, gate, rpcClient, partial, _ := replayIdentityFixture(t, false, proto.X402Version)
