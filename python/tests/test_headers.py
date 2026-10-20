@@ -284,6 +284,75 @@ class TestReceipt:
         assert parsed.is_success()
         assert parsed.challenge_id == "ch-test"
 
+    @pytest.mark.parametrize(
+        "timestamp",
+        [
+            "2024-02-29T12:30:00Z",
+            "2000-02-29T00:00:00Z",
+            "2026-01-01T00:00:00.123456789Z",
+            "2026-01-01T00:00:00+23:59",
+            "2026-01-01T00:00:00-23:59",
+            "2026-01-01T00:00:00-00:00",
+            "0001-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+            "1990-12-31T23:59:60Z",
+            "1990-12-31T15:59:60-08:00",
+            "1998-12-31T23:59:60.123456789Z",
+            "1999-01-01T00:59:60+01:00",
+            "1972-06-30T23:59:60Z",
+            "2024-02-29T23:59:60Z",
+            "9999-12-31T23:59:60Z",
+        ],
+    )
+    def test_valid_timestamp_preserves_wire_value(self, timestamp):
+        receipt = Receipt(status="success", method="solana", reference="fixture", timestamp=timestamp)
+        parsed = parse_receipt(format_receipt(receipt))
+        assert parsed.timestamp == timestamp
+        assert parse_receipt(format_receipt(parsed)).timestamp == timestamp
+
+    @pytest.mark.parametrize(
+        "timestamp",
+        [
+            "2025-02-29T12:30:00Z",
+            "1900-02-29T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T12:60:00Z",
+            "2026-01-01T12:30:61Z",
+            "2026-01-01T00:00:00+24:00",
+            "2026-01-01T00:00:00-24:00",
+            "2026-01-01T00:00:00+00:60",
+            "2026-01-01T00:00:00+01:99",
+            "2026-01-01T00:00:00-00:60",
+            "2026-01-01T00:00:00Z\n",
+            "2026-01-01T00:00:00Z\r\n",
+            "２０２６-01-01T00:00:00Z",
+            "1998-12-31T23:58:60Z",
+            "1998-12-30T23:59:60Z",
+            "1998-12-31T23:59:60+01:00",
+            "0001-01-01T00:59:60+01:00",
+            "9999-12-31T23:59:60-00:01",
+        ],
+    )
+    def test_rejects_invalid_timestamp(self, timestamp):
+        header = encode_json({"status": "success", "method": "solana", "reference": "fixture", "timestamp": timestamp})
+        with pytest.raises(ParseError, match="Invalid ISO-8601 timestamp in receipt"):
+            parse_receipt(header)
+
+    @pytest.mark.parametrize(
+        "timestamp",
+        ["2026-01-01 00:00:00Z", "2026-01-01T00:00:00", "2026-01-01t00:00:00z", "Jan 29 2026 12:00"],
+    )
+    def test_preserves_rejection_of_noncanonical_timestamp(self, timestamp):
+        header = encode_json({"status": "success", "method": "solana", "reference": "fixture", "timestamp": timestamp})
+        with pytest.raises(ParseError, match="Invalid ISO-8601 timestamp in receipt"):
+            parse_receipt(header)
+
     def test_rejects_oversized(self):
         huge = "a" * (16 * 1024 + 1)
         with pytest.raises(ParseError, match="exceeds maximum"):
