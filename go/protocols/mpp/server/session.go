@@ -15,7 +15,7 @@ package server
 //    once the close-pending state is recorded.
 //
 // On-chain verification is a seam in this layer: when
-// SessionConfig.VerifyOpenTx / VerifyTopUpTx are set, ProcessOpen (push mode)
+// SessionConfig.VerifyOpenTx / VerifyTopUpTx are set, payment-channel ProcessOpen
 // and ProcessTopUp invoke them before persisting channel state, binding the
 // payload to the attached transaction and confirming the signature on-chain.
 // When nil, the transaction signature and
@@ -52,9 +52,9 @@ type Split struct {
 // It returns the channel payer recorded by the verified transaction (open
 // account 0, base58): the deposit funder and the distribute refund
 // destination, which the program pins to channel.payer. The returned payer is
-// empty when the verifier cannot establish it (signature-only verification, or
-// a top-up that carries no open transaction); callers then fall back to the
-// payload's owner/payer fields.
+// empty when a custom verifier cannot establish it, or for a top-up; callers
+// then fall back to the payload's owner/payer fields. NewOpenTxVerifier also
+// fills an omitted payload RecentSlot with the confirmed channel's open slot.
 type SessionTxVerifier[P any] func(ctx context.Context, payload *P) (string, error)
 
 // SessionConfig is the server configuration for the session intent.
@@ -110,8 +110,8 @@ type SessionConfig struct {
 	// SettlementAuthority identifies who signs cumulative vouchers.
 	SettlementAuthority intents.SessionSettlementAuthority
 
-	// VerifyOpenTx, when set, confirms the open transaction on-chain (push
-	// mode) before ProcessOpen persists channel state. See SessionTxVerifier.
+	// VerifyOpenTx, when set, verifies escrow-backed push and pull opens
+	// before ProcessOpen persists channel state. See SessionTxVerifier.
 	VerifyOpenTx SessionTxVerifier[intents.OpenPayload]
 
 	// VerifyTopUpTx, when set, confirms the top-up transaction on-chain
@@ -237,6 +237,16 @@ func (s *SessionServer) supportsMode(mode intents.SessionMode) bool {
 	return false
 }
 
+// paymentChannelOpen distinguishes escrow-backed opens from the host-managed
+// token delegation path. Amount aliases must not turn an escrow open into a
+// trusted delegation assertion.
+func paymentChannelOpen(payload *intents.OpenPayload) bool {
+	return payload.Mode == intents.SessionModePush || (payload.Transaction != nil && *payload.Transaction != "") ||
+		(payload.ChannelID != nil && *payload.ChannelID != "" && (payload.TokenAccount == nil || *payload.TokenAccount == "")) || payload.Deposit != nil ||
+		payload.Payer != nil || payload.Payee != nil || payload.Mint != nil || payload.Salt != nil ||
+		payload.GracePeriod != nil || payload.RecentSlot != nil
+}
+
 // ProcessOpen processes an open action and persists the channel state.
 //
 // The channel is keyed by OpenPayload.SessionID (channelId first, then
@@ -270,11 +280,10 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 		return ChannelState{}, fmt.Errorf("delegated settlement requires authorizedSigner to match the operator")
 	}
 
-	// On-chain verification seam (push mode only; pull-mode host integrations
-	// submit server-broadcast transactions or validate delegated-token state
-	// before invoking this lower-level store method).
+	// Verify payment-channel opens in either submission mode. Token-delegation
+	// pull opens remain the responsibility of the host integration.
 	var verifiedPayer string
-	if payload.Mode == intents.SessionModePush && s.config.VerifyOpenTx != nil {
+	if paymentChannelOpen(payload) && s.config.VerifyOpenTx != nil {
 		var err error
 		verifiedPayer, err = s.config.VerifyOpenTx(ctx, payload)
 		if err != nil {

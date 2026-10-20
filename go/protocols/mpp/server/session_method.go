@@ -508,6 +508,7 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			Operator:         s.core.config.Operator,
 			ProgramID:        s.core.config.ProgramID,
 			Recipient:        s.recipient,
+			Splits:           s.core.config.Splits,
 		}
 		if s.openTxSubmitter == OpenTxSubmitterServer {
 			if s.rpc == nil {
@@ -549,21 +550,34 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			channelPayer = verified.Payer
 			openSlot = verified.OpenSlot
 		}
-	case mode == intents.SessionModePush:
+	case paymentChannelOpen(payload):
 		// No transaction in the payload: the client asserts a previously
-		// broadcast open. With an RPC client the open signature is confirmed
-		// on-chain before persisting; without one the channelId/deposit
+		// broadcast payment-channel open (push or operator-assisted pull).
+		// With an RPC client its confirmed account is checked before persisting;
+		// without one the channelId/deposit
 		// fields are trusted as-is.
-		channelID = *payload.ChannelID
 		var err error
+		channelID, err = payload.SessionID()
+		if err != nil {
+			return "", err
+		}
 		deposit, err = payload.DepositAmount()
 		if err != nil {
 			return "", err
 		}
 		if s.rpc != nil {
-			if err := confirmTransactionSignature(ctx, s.rpc, signature, "open"); err != nil {
+			expected := VerifyOpenTxExpected{
+				AuthorizedSigner: payload.AuthorizedSigner, Currency: s.currency,
+				MaxCap: s.cap, Network: s.network, Operator: s.core.config.Operator,
+				ProgramID: s.core.config.ProgramID, Recipient: s.recipient, Splits: s.core.config.Splits,
+			}
+			verified, err := readConfirmedOpenChannel(ctx, expected, payload, nil, s.rpc)
+			if err != nil {
 				return "", err
 			}
+			channelPayer = verified.Payer
+			openSlot = verified.OpenSlot
+			deposit = verified.Deposit
 		}
 	default:
 		// Pull mode without a channel transaction: trust the
