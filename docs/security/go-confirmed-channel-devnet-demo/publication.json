@@ -1,0 +1,8 @@
+{
+  "timestamp_utc": "2026-10-20T01:51:36.425865+00:00",
+  "fix_commit": "551ccec67e517debad2ffb6aad23b936c3abbb7b",
+  "evidence_branch": "codex/go-confirmed-channel-evidence",
+  "baseline_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "private_key_encodings_scan": "PASS; no key material included",
+  "scope": "Local HTTP server with real Devnet account and transaction data; self-minted test tokens only"
+}

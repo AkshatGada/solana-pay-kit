@@ -1,0 +1,18 @@
+{
+  "all-tests.log": "89392ba738f01aaf59377658fc89a05ba6de071387b32ed2995549f907bf4e6d",
+  "audit-summary.txt": "daa38c5ce88e431b3c670ae3d6b869aa076826572aa4848453ee39185c474c93",
+  "independent-audit.json": "dc7cbae6e181ae3f20b231c9fe753df74d4485ffe28f6664e38a8a539045b2af",
+  "mutant-discriminator.go": "eff6e0dbc567286e69d1a4333c885de4ddf1d4d8c230f024a28610d616891e0d",
+  "mutant-overlay.json": "115205750187165df7e0be6811ffdca35dde41d17d4623f5594c96456e1235e5",
+  "mutation-test.log": "b6352a5b1a7f6af6c1d02964115043fdd5743d2493c3656bc7dc7f267e64f8d1",
+  "new-regressions.log": "ccd2e29a3cb305012e5f6de9aa5f209db82a864d8d105f2ca06d1e6a9ad6b4eb",
+  "reviewed-source/go/protocols/mpp/server/session.go": "96d2d76b090e657b0702081dcb77de434c84fea5dc3caf3c34cf8e8acbc47923",
+  "reviewed-source/go/protocols/mpp/server/session_method.go": "41646da58acf10cec1937e25a69e9892bb20dbffe8d580e9af0a71a25df48c56",
+  "reviewed-source/go/protocols/mpp/server/session_method_test.go": "18d414103bbf4c84337502ec97a57af433ba4fbe407351590f73a11bc15d810c",
+  "reviewed-source/go/protocols/mpp/server/session_onchain.go": "2145cc8fee6af7c9074d1bf862f19c2e5f53f70e46657c21d8fc09323f9e05c0",
+  "reviewed-source/go/protocols/mpp/server/session_onchain_test.go": "a4ca1f8548e9e9830688507d6e4d60c6a59184ff309296b7fbd528e8032c0082",
+  "reviewed-source/go/protocols/mpp/server/session_open_channel_test.go": "b98f034c99622adf079410697c7094458713751032828ea90e80f7aa9e5e0ef9",
+  "session_open_channel_test.go": "b98f034c99622adf079410697c7094458713751032828ea90e80f7aa9e5e0ef9",
+  "source-manifest.json": "4d6a0058fa624a71f07e2fda995ba50b14083bec8b1ca4e68bf7333a060ddcfb",
+  "vet.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

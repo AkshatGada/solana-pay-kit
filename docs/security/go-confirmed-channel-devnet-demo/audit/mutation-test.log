@@ -1,0 +1,18 @@
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/valid_channel
+    session_open_channel_test.go:277: valid channel rejected: open=402 {"code":"payment_invalid","error":"payment_invalid","message":"confirmed channel account has unsupported discriminator or version","status":402,"title":"Payment Required","type":"https://paymentauth.org/problems/payment_invalid"} voucher=402 {"code":"payment_invalid","error":"payment_invalid","message":"channel 2vWoUZrrybDnxaRBEVH34LuA1MfsE5GK7EakEDc1N5a4 not found","status":402,"title":"Payment Required","type":"https://paymentauth.org/problems/payment_invalid"} calls=0
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/missing_account
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/inflated_deposit
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/zero_discriminator
+    session_open_channel_test.go:272: invalid funding reached resource: open=200 voucher=402 calls=1 state=&{ChannelID:FpAzaCU7ywxXAtSY7Suv41joiG2EAZ1rNJgkUZRuzFaT AuthorizedSigner:CeegCB5GQWPDmznXSksL67mJPuyjoKAteHRfAfXm8aNQ Deposit:1000000 OpenSlot:321654987 Cumulative:0 Sealed:false HighestVoucherSignature:<nil> HighestVoucherExpiresAt:<nil> CloseRequestedAt:<nil> SettledSignature:<nil> Operator:0x2424f3e91950 NextDeliverySequence:0 PendingDeliveries:[] CommittedDeliveries:[]}
+--- FAIL: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher (0.01s)
+    --- FAIL: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/valid_channel (0.00s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/missing_account (0.00s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/inflated_deposit (0.00s)
+    --- FAIL: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/zero_discriminator (0.00s)
+=== RUN   TestConfirmedOpenAcceptsRecordedChannelWireAccount
+    session_open_channel_test.go:313: recorded valid account: got {ChannelID: Deposit:0 GracePeriod:0 OpenSlot:0 Payer: Salt:0}, confirmed channel account has unsupported discriminator or version; want {ChannelID:2R7au9cmvZATTuExQswgEzWdUYG2e5wqZK8vCkDaNNpd Deposit:10000 GracePeriod:900 OpenSlot:512994244 Payer:AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC Salt:1792459695774501000}
+--- FAIL: TestConfirmedOpenAcceptsRecordedChannelWireAccount (0.00s)
+FAIL
+FAIL	github.com/solana-foundation/pay-kit/go/protocols/mpp/server	0.571s
+FAIL

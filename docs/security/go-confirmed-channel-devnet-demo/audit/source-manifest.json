@@ -1,0 +1,29 @@
+{
+  "timestamp_utc": "2026-10-20T01:48:17.595651+00:00",
+  "worktree": "/Users/akshatgada/solana-pay-kit/.local-worktrees/go-confirmed-session-channels",
+  "baseline_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "current_source_sha256": {
+    "go/protocols/mpp/server/session.go": "96d2d76b090e657b0702081dcb77de434c84fea5dc3caf3c34cf8e8acbc47923",
+    "go/protocols/mpp/server/session_method.go": "41646da58acf10cec1937e25a69e9892bb20dbffe8d580e9af0a71a25df48c56",
+    "go/protocols/mpp/server/session_method_test.go": "18d414103bbf4c84337502ec97a57af433ba4fbe407351590f73a11bc15d810c",
+    "go/protocols/mpp/server/session_onchain.go": "2145cc8fee6af7c9074d1bf862f19c2e5f53f70e46657c21d8fc09323f9e05c0",
+    "go/protocols/mpp/server/session_onchain_test.go": "a4ca1f8548e9e9830688507d6e4d60c6a59184ff309296b7fbd528e8032c0082",
+    "go/protocols/mpp/server/session_open_channel_test.go": "b98f034c99622adf079410697c7094458713751032828ea90e80f7aa9e5e0ef9"
+  },
+  "files_changed_since_recorded_devnet_runs": [
+    "go/protocols/mpp/server/session_open_channel_test.go"
+  ],
+  "production_sources_match_recorded_devnet_runs": true,
+  "added_tests": [
+    "TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher",
+    "TestConfirmedOpenAcceptsRecordedChannelWireAccount"
+  ],
+  "mutation_result": "Expected failure: wrong discriminator rejects real/valid channel and accepts zero discriminator; actual source unchanged.",
+  "validation": {
+    "focused_tests": "PASS",
+    "full_short_suite": "PASS",
+    "vet_composites_false": "PASS",
+    "installs": false,
+    "build_jobs": 2
+  }
+}

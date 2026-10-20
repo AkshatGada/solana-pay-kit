@@ -1,0 +1,14 @@
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/valid_channel
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/missing_account
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/inflated_deposit
+=== RUN   TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/zero_discriminator
+--- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher (0.01s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/valid_channel (0.00s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/missing_account (0.00s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/inflated_deposit (0.00s)
+    --- PASS: TestSessionMiddlewareRequiresFundedChannelAndAcceptsValidVoucher/zero_discriminator (0.00s)
+=== RUN   TestConfirmedOpenAcceptsRecordedChannelWireAccount
+--- PASS: TestConfirmedOpenAcceptsRecordedChannelWireAccount (0.00s)
+PASS
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/server	0.850s

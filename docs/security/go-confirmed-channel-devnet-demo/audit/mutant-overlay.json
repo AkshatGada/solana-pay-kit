@@ -1,0 +1,5 @@
+{
+  "Replace": {
+    "/Users/akshatgada/solana-pay-kit/.local-worktrees/go-confirmed-session-channels/go/protocols/mpp/server/session_onchain.go": "/private/tmp/pay-kit-go-confirmed-channel-audit/mutant-discriminator.go"
+  }
+}

@@ -1,0 +1,23 @@
+ok  	github.com/solana-foundation/pay-kit/go/cmd/conformance	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/cmd/protocol-runner	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/examples/playground-api	(cached)
+?   	github.com/solana-foundation/pay-kit/go/examples/simple-server	[no test files]
+ok  	github.com/solana-foundation/pay-kit/go/internal/testutil	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paycore	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paycore/paymentchannels	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paycore/signer	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paycore/solanatx	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paykit	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paykit/adapters/mpp	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/paykit/adapters/x402	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/client	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/core	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/errorcodes	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/intents	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/server	1.745s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/wire	(cached)
+?   	github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels	[no test files]
+ok  	github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels_parity_test	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/x402	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/x402/client	(cached)

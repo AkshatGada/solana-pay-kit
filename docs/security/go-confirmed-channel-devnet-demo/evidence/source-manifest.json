@@ -1,0 +1,15 @@
+{
+  "baseline_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "patched_source_sha256": {
+    "go/protocols/mpp/server/session.go": "96d2d76b090e657b0702081dcb77de434c84fea5dc3caf3c34cf8e8acbc47923",
+    "go/protocols/mpp/server/session_method.go": "41646da58acf10cec1937e25a69e9892bb20dbffe8d580e9af0a71a25df48c56",
+    "go/protocols/mpp/server/session_method_test.go": "18d414103bbf4c84337502ec97a57af433ba4fbe407351590f73a11bc15d810c",
+    "go/protocols/mpp/server/session_onchain.go": "2145cc8fee6af7c9074d1bf862f19c2e5f53f70e46657c21d8fc09323f9e05c0",
+    "go/protocols/mpp/server/session_onchain_test.go": "a4ca1f8548e9e9830688507d6e4d60c6a59184ff309296b7fbd528e8032c0082",
+    "go/protocols/mpp/server/session_open_channel_test.go": "c2d6ecdaf093ad53a53211c083efbdd0a8a2e4376b7922ff51cbfe1b1939f5a3"
+  },
+  "initial_patch_changed_files": [
+    "go/protocols/mpp/server/session_onchain.go",
+    "go/protocols/mpp/server/session_open_channel_test.go"
+  ]
+}

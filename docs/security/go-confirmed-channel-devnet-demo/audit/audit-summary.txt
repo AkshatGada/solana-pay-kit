@@ -1,0 +1,18 @@
+Sol 6.1 extra-high audit: no blocking finding within the confirmed-channel OPEN verification scope.
+
+The independent auditor reviewed the corrected production patch, all changed tests, exact captured Devnet account bytes, transaction wire and balances, baseline overlay source, raw RPC/HTTP evidence, screenshots and checksums. Production code is byte-identical to the corrected Devnet runs. Only regression tests changed afterward; exact final source hashes are recorded in source-manifest.json and independent-audit.json.
+
+Valid-channel regression coverage added:
+- Public HTTP middleware: a valid funded account opens successfully, emits a receipt, persists chain-derived deposit/payer/openSlot, and accepts a genuinely signed voucher.
+- Missing account, overstated deposit and zero discriminator: HTTP402, no persisted channel and no resource handler calls, including voucher attempts.
+- Exact 256-byte captured Devnet account golden, independent of the generated account encoder, verifies the supported wire layout and discriminator.
+- Mutation check: replacing only the corrected discriminator1 with0 causes the new positive/golden tests and zero-discriminator rejection to fail, proving regression sensitivity. The intentionally failing mutant is an isolated compiler overlay; production code was not mutated.
+
+Validation: focused regressions PASS; full go test -short ./... PASS; go vet -composites=false ./... PASS; git diff --check PASS. Builds limited to two jobs. No dependency installations. Vet's composites check is disabled for pre-existing generated unkeyed literals. Hosted E2E is disabled; real-chain evidence remains the recorded manual Devnet runs.
+
+Limits: the audit did not independently repeat live-chain calls. The real-chain evidence covers signature-only push opens, using one reusable channel and independent stores, with disposable Devnet wallets and self-minted SPL tokens. Settlement and withdrawals were not tested. Existing top-up verification and host-managed token delegation are outside this fix and retain their prior trust behavior. No claim of comprehensive session security.
+
+Original evidence remains at:
+/Users/akshatgada/.codex/visualizations/2026/10/20/01a156ea-c24d-7ca3-89b5-546831bf3b18/go-confirmed-channel-evidence/report.html
+
+This addendum contains the final reviewed source snapshots, audit findings, validation logs and mutation-check record. Everything stays local. No commit, push, PR or maintainer contact.

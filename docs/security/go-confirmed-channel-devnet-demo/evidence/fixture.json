@@ -1,0 +1,13 @@
+{
+  "Channel": "2R7au9cmvZATTuExQswgEzWdUYG2e5wqZK8vCkDaNNpd",
+  "Missing": "7fZmwhS599GDrUnYfgCNLoetdicggcFAuNZktUroKtmJ",
+  "Signature": "53nAyvJeEBzYCeawXpT2S5E9SReamZKiGpBknTz9DWrXQQxAPSuguEyVmqeUkad3P6ji3Ng7szuAq394cSXF8oEf",
+  "Setup": "2Lj7Pppm9ahiN2kcXCXP3LrXfGNpYizmqpgXQxjgY4EoEBc8X8nKx3eSgvbDLzKqWdqKnUEPeSF3c5AVbLtvkgT3",
+  "Operator": "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+  "Client": "AQ58iYhav6paopnGhGpoZW1pUyp4Mwr1TTy8rdSN9EhC",
+  "Mint": "G4BUMgcYFzGb4c23Uuph634wNe5DzNGNRvLPAgTqKjsk",
+  "Salt": 1792459695774501000,
+  "OpenSlot": 512994244,
+  "Deposit": 10000,
+  "Grace": 900
+}

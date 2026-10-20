@@ -1,0 +1,80 @@
+[
+  {
+    "time_utc": "2026-10-20T01:21:36.502318+00:00",
+    "endpoint": "https://api.devnet.solana.com",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "getGenesisHash",
+      "params": []
+    },
+    "response": {
+      "jsonrpc": "2.0",
+      "result": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+      "id": 1
+    }
+  },
+  {
+    "time_utc": "2026-10-20T01:21:36.802771+00:00",
+    "endpoint": "https://api.devnet.solana.com",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "getAccountInfo",
+      "params": [
+        "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX",
+        {
+          "encoding": "base64",
+          "commitment": "confirmed"
+        }
+      ]
+    },
+    "response": {
+      "jsonrpc": "2.0",
+      "result": {
+        "context": {
+          "apiVersion": "4.4.0-beta.0",
+          "slot": 512992575
+        },
+        "value": {
+          "data": [
+            "AgAAAK2b5QUCojamGLeZk9YvnvqOSMQXOWdR+3Tiz2J5wRfQ",
+            "base64"
+          ],
+          "executable": true,
+          "lamports": 1141440,
+          "owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+          "rentEpoch": 18446744073709551615,
+          "space": 36
+        }
+      },
+      "id": 2
+    }
+  },
+  {
+    "time_utc": "2026-10-20T01:21:37.061330+00:00",
+    "endpoint": "https://api.devnet.solana.com",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "getBalance",
+      "params": [
+        "BEp3YGFVFEAMJ1PeHBPNFoYfeP65aqosHxhsgmHmDoSs",
+        {
+          "commitment": "confirmed"
+        }
+      ]
+    },
+    "response": {
+      "jsonrpc": "2.0",
+      "result": {
+        "context": {
+          "apiVersion": "4.4.0-beta.0",
+          "slot": 512992576
+        },
+        "value": 4966696409
+      },
+      "id": 3
+    }
+  }
+]

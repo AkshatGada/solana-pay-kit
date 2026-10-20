@@ -1,0 +1,7 @@
+{
+  "Replace": {
+    "/Users/akshatgada/solana-pay-kit/.local-worktrees/go-confirmed-session-channels/go/protocols/mpp/server/session.go": "/private/tmp/pay-kit-go-confirmed-channel-evidence/baseline-session.go",
+    "/Users/akshatgada/solana-pay-kit/.local-worktrees/go-confirmed-session-channels/go/protocols/mpp/server/session_method.go": "/private/tmp/pay-kit-go-confirmed-channel-evidence/baseline-session_method.go",
+    "/Users/akshatgada/solana-pay-kit/.local-worktrees/go-confirmed-session-channels/go/protocols/mpp/server/session_onchain.go": "/private/tmp/pay-kit-go-confirmed-channel-evidence/baseline-session_onchain.go"
+  }
+}

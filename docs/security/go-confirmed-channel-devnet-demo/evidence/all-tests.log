@@ -1,0 +1,23 @@
+ok  	github.com/solana-foundation/pay-kit/go/cmd/conformance	0.516s
+ok  	github.com/solana-foundation/pay-kit/go/cmd/protocol-runner	1.028s
+ok  	github.com/solana-foundation/pay-kit/go/examples/playground-api	1.135s
+?   	github.com/solana-foundation/pay-kit/go/examples/simple-server	[no test files]
+ok  	github.com/solana-foundation/pay-kit/go/internal/testutil	0.874s
+ok  	github.com/solana-foundation/pay-kit/go/paycore	0.482s
+ok  	github.com/solana-foundation/pay-kit/go/paycore/paymentchannels	0.878s
+ok  	github.com/solana-foundation/pay-kit/go/paycore/signer	0.915s
+ok  	github.com/solana-foundation/pay-kit/go/paycore/solanatx	1.230s
+ok  	github.com/solana-foundation/pay-kit/go/paykit	8.144s
+ok  	github.com/solana-foundation/pay-kit/go/paykit/adapters/mpp	1.110s
+ok  	github.com/solana-foundation/pay-kit/go/paykit/adapters/x402	0.540s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp	0.523s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/client	0.583s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/core	0.519s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/errorcodes	0.506s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/intents	0.533s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/server	(cached)
+ok  	github.com/solana-foundation/pay-kit/go/protocols/mpp/wire	0.482s
+?   	github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels	[no test files]
+ok  	github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels_parity_test	0.507s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/x402	0.506s
+ok  	github.com/solana-foundation/pay-kit/go/protocols/x402/client	0.548s
