@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -583,6 +584,105 @@ func TestSessionConfirmedOpenReplayPreservesWatermark(t *testing.T) {
 	state := mustGetChannel(t, session, fixture.channel.String())
 	if state.Cumulative != 250_000 || state.NextDeliverySequence != 7 {
 		t.Fatalf("replayed open erased state: %+v", state)
+	}
+}
+
+// Simulate deletion between the replay lookup and the atomic state update.
+type deletingOpenReplayStore struct{ ChannelStore }
+
+func (s deletingOpenReplayStore) GetChannel(ctx context.Context, id string) (*ChannelState, error) {
+	state, err := s.ChannelStore.GetChannel(ctx, id)
+	if err == nil && state != nil {
+		err = s.ChannelStore.DeleteChannel(ctx, id)
+	}
+	return state, err
+}
+
+func TestConfirmedOpenReplayAfterTopUp(t *testing.T) {
+	for _, path := range []string{"core/signature-only", "core/attached", "public/signature-only", "public/attached", "public/server-submitted"} {
+		t.Run(path, func(t *testing.T) {
+			fixture := buildOpenTxFixture(t)
+			if strings.HasSuffix(path, "signature-only") {
+				fixture.payload.Transaction = nil
+			}
+			r := newSessionChannelRPC(t, fixture, nil)
+			var server *SessionServer
+			var open func(*intents.OpenPayload) error
+			if strings.HasPrefix(path, "core/") {
+				config := openSessionConfig(fixture)
+				config.VerifyOpenTx = NewOpenTxVerifier(config, r)
+				server = newSessionTestServer(config)
+				open = func(payload *intents.OpenPayload) error {
+					_, err := server.ProcessOpen(context.Background(), payload)
+					return err
+				}
+			} else {
+				session := newTestSession(t, func(o *SessionOptions) {
+					o.RPC = r
+					o.Operator = fixture.payer.PublicKey().String()
+					o.Recipient = fixture.payee.String()
+					if strings.HasSuffix(path, "server-submitted") {
+						o.OpenTxSubmitter = OpenTxSubmitterServer
+					}
+				})
+				server = session.Core()
+				open = func(payload *intents.OpenPayload) error {
+					_, err := verifySessionAction(t, session, intents.NewOpenAction(*payload))
+					return err
+				}
+			}
+			if err := open(&fixture.payload); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.ProcessTopUp(context.Background(), &intents.TopUpPayload{
+				ChannelID: fixture.channel.String(), NewDeposit: "1500000", Signature: fixture.signature,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			r.account = newSessionChannelRPC(t, fixture, func(c *pcgen.Channel) { c.Deposit = 1_500_000 }).account
+			before, err := server.Store().UpdateChannel(context.Background(), fixture.channel.String(), func(current *ChannelState) (ChannelState, error) {
+				current.Cumulative = 250_000
+				current.NextDeliverySequence = 7
+				return *current, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads, sends := r.reads, len(r.Sent)
+			if err := open(&fixture.payload); err != nil {
+				t.Fatalf("original open rejected after top-up: %v", err)
+			}
+			after, err := server.Store().GetChannel(context.Background(), fixture.channel.String())
+			if err != nil || !reflect.DeepEqual(&before, after) {
+				t.Fatalf("replay changed topped-up state: before=%+v after=%+v err=%v", before, after, err)
+			}
+			intruder := fixture.payload
+			intruder.AuthorizedSigner = testutil.NewPrivateKey().PublicKey().String()
+			if err := open(&intruder); err == nil {
+				t.Fatal("different signer replay accepted")
+			}
+			if _, err := server.Store().MarkSealed(context.Background(), fixture.channel.String()); err != nil {
+				t.Fatal(err)
+			}
+			if err := open(&fixture.payload); err == nil {
+				t.Fatal("sealed channel replay accepted")
+			}
+			if r.reads != reads || len(r.Sent) != sends {
+				t.Fatal("existing channel replay read chain funding or rebroadcast")
+			}
+			if _, err := server.Store().UpdateChannel(context.Background(), fixture.channel.String(), func(*ChannelState) (ChannelState, error) {
+				return before, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			server.store = deletingOpenReplayStore{server.store}
+			if err := open(&fixture.payload); err == nil || !strings.Contains(err.Error(), "disappeared") {
+				t.Fatalf("deleted replay recreated unverified state: %v", err)
+			}
+			if state, err := server.Store().GetChannel(context.Background(), fixture.channel.String()); err != nil || state != nil {
+				t.Fatalf("deleted channel recreated: %+v, %v", state, err)
+			}
+		})
 	}
 }
 

@@ -494,6 +494,7 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 	// Channel open_slot (a PDA seed), read from the verified open transaction
 	// when one is present, else from the payload's recentSlot echo.
 	openSlot := openSlotFromPayload(payload)
+	replaying := false
 
 	switch {
 	case hasTransaction:
@@ -510,40 +511,42 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			Recipient:        s.recipient,
 			Splits:           s.core.config.Splits,
 		}
-		if s.openTxSubmitter == OpenTxSubmitterServer {
-			if s.rpc == nil {
-				return "", fmt.Errorf("openTxSubmitter=server requires an rpc client")
-			}
-			// Decode-only first so an idempotent replay of an
-			// already-persisted open does not rebroadcast the transaction.
-			preVerified, err := VerifyOpenTx(ctx, expected, payload, nil)
+		if s.openTxSubmitter == OpenTxSubmitterServer && s.rpc == nil {
+			return "", fmt.Errorf("openTxSubmitter=server requires an rpc client")
+		}
+		// Bind the attached transaction first, then recognize existing state
+		// before reading funding that may have changed after a top-up.
+		preVerified, err := VerifyOpenTx(ctx, expected, payload, nil)
+		if err != nil {
+			return "", err
+		}
+		existing, err := s.core.store.GetChannel(ctx, preVerified.ChannelID)
+		if err != nil {
+			return "", err
+		}
+		if existing != nil {
+			replaying = true
+			channelID = preVerified.ChannelID
+			deposit = preVerified.Deposit
+			channelPayer = preVerified.Payer
+			openSlot = preVerified.OpenSlot
+		} else if s.openTxSubmitter == OpenTxSubmitterServer {
+			submitted, err := SubmitOpenTx(ctx, expected, payload, s.payerSigner, s.rpc)
 			if err != nil {
 				return "", err
 			}
-			existing, err := s.core.store.GetChannel(ctx, preVerified.ChannelID)
-			if err != nil {
-				return "", err
-			}
-			if existing != nil {
-				channelID = preVerified.ChannelID
-				deposit = preVerified.Deposit
-				channelPayer = preVerified.Payer
-				openSlot = preVerified.OpenSlot
-			} else {
-				submitted, err := SubmitOpenTx(ctx, expected, payload, s.payerSigner, s.rpc)
+			channelID = submitted.ChannelID
+			deposit = submitted.Deposit
+			channelPayer = submitted.Payer
+			openSlot = submitted.OpenSlot
+			signature = submitted.Signature
+		} else {
+			verified := preVerified
+			if s.rpc != nil {
+				verified, err = readConfirmedOpenChannel(ctx, expected, payload, &preVerified, s.rpc)
 				if err != nil {
 					return "", err
 				}
-				channelID = submitted.ChannelID
-				deposit = submitted.Deposit
-				channelPayer = submitted.Payer
-				openSlot = submitted.OpenSlot
-				signature = submitted.Signature
-			}
-		} else {
-			verified, err := VerifyOpenTx(ctx, expected, payload, s.rpc)
-			if err != nil {
-				return "", err
 			}
 			channelID = verified.ChannelID
 			deposit = verified.Deposit
@@ -565,7 +568,12 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 		if err != nil {
 			return "", err
 		}
-		if s.rpc != nil {
+		existing, err := s.core.store.GetChannel(ctx, channelID)
+		if err != nil {
+			return "", err
+		}
+		replaying = existing != nil
+		if !replaying && s.rpc != nil {
 			expected := VerifyOpenTxExpected{
 				AuthorizedSigner: payload.AuthorizedSigner, Currency: s.currency,
 				MaxCap: s.cap, Network: s.network, Operator: s.core.config.Operator,
@@ -626,6 +634,9 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 					payload.AuthorizedSigner, channelID)
 			}
 			return *current, nil
+		}
+		if replaying {
+			return ChannelState{}, fmt.Errorf("channel %s disappeared during open replay; retry the open", channelID)
 		}
 		return fresh, nil
 	}); err != nil {

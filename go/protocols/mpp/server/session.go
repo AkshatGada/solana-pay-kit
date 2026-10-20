@@ -279,11 +279,18 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 		payload.AuthorizedSigner != s.config.Operator {
 		return ChannelState{}, fmt.Errorf("delegated settlement requires authorizedSigner to match the operator")
 	}
+	existing, err := s.store.GetChannel(ctx, sessionID)
+	if err != nil {
+		return ChannelState{}, err
+	}
+	replaying := existing != nil
 
 	// Verify payment-channel opens in either submission mode. Token-delegation
-	// pull opens remain the responsibility of the host integration.
+	// pull opens remain the responsibility of the host integration. An existing
+	// session is checked atomically below; its original deposit may be stale
+	// after a top-up, so it must not be verified as a fresh open.
 	var verifiedPayer string
-	if paymentChannelOpen(payload) && s.config.VerifyOpenTx != nil {
+	if !replaying && paymentChannelOpen(payload) && s.config.VerifyOpenTx != nil {
 		var err error
 		verifiedPayer, err = s.config.VerifyOpenTx(ctx, payload)
 		if err != nil {
@@ -306,10 +313,7 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 		Operator:         operator,
 	}
 
-	// Atomic check-and-insert: a replayed open re-passes all checks above
-	// (the referenced tx is genuinely confirmed), so it MUST NOT overwrite
-	// existing state; that would reset the voucher watermark and erase
-	// accepted vouchers before close.
+	// Atomic check-and-insert: a replay must keep existing funding and vouchers.
 	return s.store.UpdateChannel(ctx, sessionID, func(existing *ChannelState) (ChannelState, error) {
 		if existing != nil {
 			if existing.Sealed {
@@ -320,6 +324,9 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 			}
 			// Idempotent replay: keep existing state untouched.
 			return *existing, nil
+		}
+		if replaying {
+			return ChannelState{}, fmt.Errorf("channel %s disappeared during open replay; retry the open", sessionID)
 		}
 		return fresh, nil
 	})
