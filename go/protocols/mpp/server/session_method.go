@@ -612,12 +612,17 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 	// Prefer the payer read from the verified open transaction (account 0, what
 	// the channel actually records) over the client-supplied payload fields.
 	operator := operatorFromVerifiedOpen(channelPayer, payload.Owner, payload.Payer)
+	admission := openAdmissionHost
+	if s.rpc != nil {
+		admission = openAdmissionRPC
+	}
 	fresh := ChannelState{
-		ChannelID:        channelID,
-		AuthorizedSigner: payload.AuthorizedSigner,
-		Deposit:          deposit,
-		OpenSlot:         openSlot,
-		Operator:         operator,
+		OpenFundingContext: s.core.openFundingContext(payload, admission),
+		ChannelID:          channelID,
+		AuthorizedSigner:   payload.AuthorizedSigner,
+		Deposit:            deposit,
+		OpenSlot:           openSlot,
+		Operator:           operator,
 	}
 
 	// The existence check lives inside the atomic mutator so a concurrent
@@ -632,6 +637,9 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 				return ChannelState{}, fmt.Errorf(
 					"open replay: authorizedSigner %s does not match existing channel %s",
 					payload.AuthorizedSigner, channelID)
+			}
+			if err := checkOpenFundingContext(current, fresh.OpenFundingContext); err != nil {
+				return ChannelState{}, err
 			}
 			return *current, nil
 		}

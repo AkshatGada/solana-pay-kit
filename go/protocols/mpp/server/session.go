@@ -112,6 +112,10 @@ type SessionConfig struct {
 
 	// VerifyOpenTx, when set, verifies escrow-backed push and pull opens
 	// before ProcessOpen persists channel state. See SessionTxVerifier.
+	// It is a fresh-admission trust root, not per-request authorization. Hosts
+	// changing verifier policy (including its RPC capability) must use a separate
+	// store namespace. Core-verifier admission is distinct from public
+	// RPC-confirmed admission: a nonnil verifier may check only transaction structure.
 	VerifyOpenTx SessionTxVerifier[intents.OpenPayload]
 
 	// VerifyTopUpTx, when set, confirms the top-up transaction on-chain
@@ -305,12 +309,17 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 	// could be stale/wrong. Fall back to the payload only for opens with no
 	// transaction to verify (bare push assertion / pull).
 	operator := operatorFromVerifiedOpen(verifiedPayer, payload.Owner, payload.Payer)
+	admission := openAdmissionHost
+	if s.config.VerifyOpenTx != nil {
+		admission = openAdmissionCoreVerifier
+	}
 	fresh := ChannelState{
-		ChannelID:        sessionID,
-		AuthorizedSigner: payload.AuthorizedSigner,
-		Deposit:          deposit,
-		OpenSlot:         openSlotFromPayload(payload),
-		Operator:         operator,
+		OpenFundingContext: s.openFundingContext(payload, admission),
+		ChannelID:          sessionID,
+		AuthorizedSigner:   payload.AuthorizedSigner,
+		Deposit:            deposit,
+		OpenSlot:           openSlotFromPayload(payload),
+		Operator:           operator,
 	}
 
 	// Atomic check-and-insert: a replay must keep existing funding and vouchers.
@@ -321,6 +330,9 @@ func (s *SessionServer) ProcessOpen(ctx context.Context, payload *intents.OpenPa
 			}
 			if existing.AuthorizedSigner != payload.AuthorizedSigner {
 				return ChannelState{}, fmt.Errorf("channel %s already exists with a different authorized signer", sessionID)
+			}
+			if err := checkOpenFundingContext(existing, fresh.OpenFundingContext); err != nil {
+				return ChannelState{}, err
 			}
 			// Idempotent replay: keep existing state untouched.
 			return *existing, nil
