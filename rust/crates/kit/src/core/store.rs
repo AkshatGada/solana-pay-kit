@@ -43,6 +43,17 @@ pub trait Store: Send + Sync {
         key: &str,
         value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>>;
+
+    /// Atomically write `value` only if the key currently holds `expected`
+    /// (`None`: the key is absent). Returns `true` if the value was written.
+    /// Implementations MUST compare and write in one atomic step;
+    /// [`conformance::check_store`] exercises it.
+    fn put_if_eq(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +146,31 @@ impl Store for MemoryStore {
             }
         })
     }
+
+    fn put_if_eq(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let key = key.to_string();
+        let serialized =
+            serde_json::to_string(&value).map_err(|e| StoreError::Serialization(e.to_string()));
+        Box::pin(async move {
+            let serialized = serialized?;
+            let mut data = self.data.lock().unwrap();
+            let current = data
+                .get(&key)
+                .map(|raw| serde_json::from_str::<serde_json::Value>(raw))
+                .transpose()
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            if current != expected {
+                return Ok(false);
+            }
+            data.insert(key, serialized);
+            Ok(true)
+        })
+    }
 }
 
 // ── Charge replay / idempotency store ──
@@ -177,6 +213,10 @@ pub enum ChargeRecordState {
     Confirmed,
     /// Settlement failed terminally; `failure_reason` explains why.
     Failed,
+    /// Broadcast, but confirmation was ambiguous (timeout, RPC error).
+    /// `final_signature` is the broadcast signature; a retry reconciles it
+    /// before any replacement payment is allowed.
+    Pending,
 }
 
 /// A durable record of one charge-settlement attempt, keyed by challenge id.
@@ -202,16 +242,24 @@ pub struct ChargeRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargeReservation {
     /// First presentation of this challenge id + digest (or a prior
-    /// reservation's lease expired). The caller now owns this record and
-    /// MUST eventually call `mark_confirmed` or `mark_failed` — no other
-    /// concurrent caller can also receive `Reserved` for the same key.
-    Reserved,
+    /// reservation's lease expired). The caller now owns `generation` of this
+    /// record and MUST eventually call `mark_confirmed` or `mark_failed` — no
+    /// other caller can receive `Reserved` for the same generation.
+    Reserved { generation: u64 },
     /// An earlier presentation with the same digest already confirmed.
     /// Return `final_signature` to the caller instead of re-settling.
     AlreadyConfirmed { final_signature: String },
     /// An earlier presentation with the same digest already failed
     /// terminally.
     AlreadyFailed { reason: String },
+    /// An earlier presentation with the same digest was broadcast but its
+    /// outcome is unknown. The caller reconciles `final_signature` and settles
+    /// it with `confirm_pending`, or `mark_failed` for `generation`; it must
+    /// NOT broadcast again.
+    PendingConfirmation {
+        generation: u64,
+        final_signature: String,
+    },
     /// An earlier presentation with the same digest is still being settled
     /// (or its owner crashed before the lease expired). The caller must NOT
     /// settle again; it should ask the client to retry shortly.
@@ -221,8 +269,19 @@ pub enum ChargeReservation {
     Conflict,
 }
 
-fn charge_record_key(challenge_id: &str) -> String {
-    format!("solana-charge:record:{challenge_id}")
+/// Bound on a record's generation chain. Each generation past the first is
+/// an expired-lease takeover or a terminal outcome, so this is never reached
+/// by a live challenge.
+const MAX_CHARGE_RECORD_GENERATIONS: u64 = 64;
+
+/// Key of `generation` of a charge record. Generation 0 keeps the original
+/// key, so records written before generations existed read as generation 0.
+fn charge_record_key(challenge_id: &str, generation: u64) -> String {
+    if generation == 0 {
+        format!("solana-charge:record:{challenge_id}")
+    } else {
+        format!("solana-charge:record:{challenge_id}:{generation}")
+    }
 }
 
 fn now_unix() -> i64 {
@@ -231,14 +290,11 @@ fn now_unix() -> i64 {
 
 /// Idempotent charge-settlement ledger built on top of a plain [`Store`].
 ///
-/// Only the caller that receives [`ChargeReservation::Reserved`] from
-/// [`Self::reserve`] may call [`Self::mark_confirmed`] or
-/// [`Self::mark_failed`] for that challenge id — every other concurrent
-/// caller is turned away with `InProgress` or `Conflict` before doing any
-/// settlement work. That invariant is what lets `mark_confirmed`/
-/// `mark_failed` use a plain read-then-write instead of a compare-and-swap:
-/// there is never more than one writer per key between a `Reserved` outcome
-/// and its matching `mark_*` call.
+/// A record is an append-only chain of generations. Every transition out of
+/// generation `g` — an expired-lease takeover or a terminal outcome — is a
+/// `put_if_absent` of generation `g + 1`, so exactly one of them wins and a
+/// stale owner whose lease was taken over can never overwrite the newer
+/// owner's state. The latest generation is the record's state.
 #[derive(Clone)]
 pub struct ChargeReplayStore {
     store: Arc<dyn Store>,
@@ -249,6 +305,52 @@ impl ChargeReplayStore {
         Self { store }
     }
 
+    async fn read(
+        &self,
+        challenge_id: &str,
+        generation: u64,
+    ) -> Result<Option<ChargeRecord>, StoreError> {
+        self.store
+            .get(&charge_record_key(challenge_id, generation))
+            .await?
+            .map(|value| {
+                serde_json::from_value(value).map_err(|e| StoreError::Serialization(e.to_string()))
+            })
+            .transpose()
+    }
+
+    /// The latest generation of `challenge_id` and its record.
+    async fn tip(&self, challenge_id: &str) -> Result<Option<(u64, ChargeRecord)>, StoreError> {
+        let Some(mut record) = self.read(challenge_id, 0).await? else {
+            return Ok(None);
+        };
+        let mut generation = 0;
+        while let Some(next) = self.read(challenge_id, generation + 1).await? {
+            generation += 1;
+            if generation >= MAX_CHARGE_RECORD_GENERATIONS {
+                return Err(StoreError::Internal(format!(
+                    "charge record `{challenge_id}` exceeds {MAX_CHARGE_RECORD_GENERATIONS} generations"
+                )));
+            }
+            record = next;
+        }
+        Ok(Some((generation, record)))
+    }
+
+    /// Append `record` as `generation`; `false` when another writer won it.
+    async fn append(
+        &self,
+        challenge_id: &str,
+        generation: u64,
+        record: &ChargeRecord,
+    ) -> Result<bool, StoreError> {
+        let value =
+            serde_json::to_value(record).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.store
+            .put_if_absent(&charge_record_key(challenge_id, generation), value)
+            .await
+    }
+
     /// Reserve `challenge_id` for settlement, or classify an existing
     /// record. See [`ChargeReservation`] for the possible outcomes.
     pub async fn reserve(
@@ -257,7 +359,6 @@ impl ChargeReplayStore {
         normalized_request_digest: &str,
         lease: Duration,
     ) -> Result<ChargeReservation, StoreError> {
-        let key = charge_record_key(challenge_id);
         let now = now_unix();
         let fresh = ChargeRecord {
             challenge_id: challenge_id.to_string(),
@@ -268,96 +369,217 @@ impl ChargeReplayStore {
             updated_at: now,
             expires_at: now + lease.as_secs() as i64,
         };
-        let fresh_value =
-            serde_json::to_value(&fresh).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        if self.store.put_if_absent(&key, fresh_value.clone()).await? {
-            return Ok(ChargeReservation::Reserved);
+        if self.append(challenge_id, 0, &fresh).await? {
+            return Ok(ChargeReservation::Reserved { generation: 0 });
         }
-
-        let existing = self.store.get(&key).await?.ok_or_else(|| {
-            StoreError::Internal("charge record vanished after put_if_absent conflict".into())
-        })?;
-        let existing: ChargeRecord = serde_json::from_value(existing)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        if existing.normalized_request_digest != normalized_request_digest {
-            return Ok(ChargeReservation::Conflict);
-        }
-
-        match existing.state {
-            ChargeRecordState::Confirmed => Ok(ChargeReservation::AlreadyConfirmed {
-                final_signature: existing.final_signature.unwrap_or_default(),
-            }),
-            ChargeRecordState::Failed => Ok(ChargeReservation::AlreadyFailed {
-                reason: existing.failure_reason.unwrap_or_default(),
-            }),
-            ChargeRecordState::Reserved if existing.expires_at <= now => {
-                // The prior reservation's lease expired — presumed abandoned
-                // (e.g. the process that reserved it crashed before
-                // confirming or failing). Reclaim it via `put` (not
-                // `put_if_absent`, which would fail since the key exists).
-                self.store.put(&key, fresh_value).await?;
-                Ok(ChargeReservation::Reserved)
+        for _ in 0..MAX_CHARGE_RECORD_GENERATIONS {
+            let (generation, existing) = self.tip(challenge_id).await?.ok_or_else(|| {
+                StoreError::Internal("charge record vanished after put_if_absent conflict".into())
+            })?;
+            if existing.normalized_request_digest != normalized_request_digest {
+                return Ok(ChargeReservation::Conflict);
             }
-            ChargeRecordState::Reserved => Ok(ChargeReservation::InProgress),
+            match existing.state {
+                ChargeRecordState::Confirmed => {
+                    return Ok(ChargeReservation::AlreadyConfirmed {
+                        final_signature: existing.final_signature.unwrap_or_default(),
+                    })
+                }
+                ChargeRecordState::Failed => {
+                    return Ok(ChargeReservation::AlreadyFailed {
+                        reason: existing.failure_reason.unwrap_or_default(),
+                    })
+                }
+                // Never lease-reclaimed: the broadcast may still land.
+                ChargeRecordState::Pending => {
+                    return Ok(ChargeReservation::PendingConfirmation {
+                        generation,
+                        final_signature: existing.final_signature.unwrap_or_default(),
+                    })
+                }
+                ChargeRecordState::Reserved if existing.expires_at > now => {
+                    return Ok(ChargeReservation::InProgress)
+                }
+                // The prior owner's lease expired — presumed crashed. Taking
+                // over appends the next generation, which fences that owner.
+                ChargeRecordState::Reserved => {
+                    if self.append(challenge_id, generation + 1, &fresh).await? {
+                        return Ok(ChargeReservation::Reserved {
+                            generation: generation + 1,
+                        });
+                    }
+                }
+            }
         }
+        Err(StoreError::Internal(format!(
+            "charge record `{challenge_id}` is contended"
+        )))
     }
 
-    /// Transition a reserved record to `Confirmed`. Only the caller that
-    /// received `Reserved` from `reserve` for this `challenge_id` may call
-    /// this — see struct docs.
+    /// Record the confirmed settlement signature.
+    ///
+    /// A confirmed signature is an on-chain fact, so it supersedes any
+    /// non-confirmed state whichever owner reports it, and is never replaced.
+    /// Fails when the challenge was never reserved.
     pub async fn mark_confirmed(
         &self,
         challenge_id: &str,
         final_signature: &str,
     ) -> Result<(), StoreError> {
-        self.settle(
-            challenge_id,
-            ChargeRecordState::Confirmed,
-            Some(final_signature.to_string()),
-            None,
-        )
-        .await
+        for _ in 0..MAX_CHARGE_RECORD_GENERATIONS {
+            let (generation, record) = self.tip(challenge_id).await?.ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "cannot settle charge record `{challenge_id}`: no reservation found"
+                ))
+            })?;
+            if record.state == ChargeRecordState::Confirmed {
+                return Ok(());
+            }
+            let confirmed = terminal(
+                record,
+                ChargeRecordState::Confirmed,
+                Some(final_signature.to_string()),
+                None,
+            );
+            if self
+                .append(challenge_id, generation + 1, &confirmed)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(StoreError::Internal(format!(
+            "charge record `{challenge_id}` is contended"
+        )))
     }
 
-    /// Transition a reserved record to `Failed`. Only the caller that
-    /// received `Reserved` from `reserve` for this `challenge_id` may call
-    /// this — see struct docs.
-    pub async fn mark_failed(&self, challenge_id: &str, reason: &str) -> Result<(), StoreError> {
-        self.settle(
-            challenge_id,
-            ChargeRecordState::Failed,
-            None,
-            Some(reason.to_string()),
-        )
-        .await
-    }
-
-    async fn settle(
+    /// Confirm the pending broadcast at `generation` (from
+    /// [`ChargeReservation::PendingConfirmation`]).
+    ///
+    /// Exactly one caller wins this claim; `false`, writing nothing, means the
+    /// pending generation was already resolved by another caller.
+    pub async fn confirm_pending(
         &self,
         challenge_id: &str,
-        state: ChargeRecordState,
-        final_signature: Option<String>,
-        failure_reason: Option<String>,
-    ) -> Result<(), StoreError> {
-        let key = charge_record_key(challenge_id);
-        let existing = self.store.get(&key).await?.ok_or_else(|| {
+        generation: u64,
+        final_signature: &str,
+    ) -> Result<bool, StoreError> {
+        let (tip, record) = self.tip(challenge_id).await?.ok_or_else(|| {
             StoreError::Internal(format!(
                 "cannot settle charge record `{challenge_id}`: no reservation found"
             ))
         })?;
-        let mut record: ChargeRecord = serde_json::from_value(existing)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-        record.state = state;
-        record.final_signature = final_signature;
-        record.failure_reason = failure_reason;
-        record.updated_at = now_unix();
-        record.expires_at = record.updated_at + DEFAULT_CHARGE_RECORD_RETENTION.as_secs() as i64;
-        let value =
-            serde_json::to_value(&record).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        self.store.put(&key, value).await
+        if tip != generation
+            || record.state != ChargeRecordState::Pending
+            || record.final_signature.as_deref() != Some(final_signature)
+        {
+            return Ok(false);
+        }
+        let confirmed = terminal(
+            record,
+            ChargeRecordState::Confirmed,
+            Some(final_signature.to_string()),
+            None,
+        );
+        self.append(challenge_id, generation + 1, &confirmed).await
     }
+
+    /// The pending broadcast recorded for `challenge_id` under
+    /// `normalized_request_digest`, as `(generation, final_signature)`.
+    /// Never creates a reservation.
+    pub async fn pending(
+        &self,
+        challenge_id: &str,
+        normalized_request_digest: &str,
+    ) -> Result<Option<(u64, String)>, StoreError> {
+        Ok(match self.tip(challenge_id).await? {
+            Some((generation, record))
+                if record.state == ChargeRecordState::Pending
+                    && record.normalized_request_digest == normalized_request_digest =>
+            {
+                record
+                    .final_signature
+                    .map(|signature| (generation, signature))
+            }
+            _ => None,
+        })
+    }
+
+    /// Record that `final_signature` was broadcast but its outcome is unknown,
+    /// for the reservation `generation` returned by [`Self::reserve`].
+    ///
+    /// Returns `false`, writing nothing, when that reservation is no longer
+    /// current.
+    pub async fn mark_pending(
+        &self,
+        challenge_id: &str,
+        generation: u64,
+        final_signature: &str,
+    ) -> Result<bool, StoreError> {
+        let (tip, record) = self.tip(challenge_id).await?.ok_or_else(|| {
+            StoreError::Internal(format!(
+                "cannot settle charge record `{challenge_id}`: no reservation found"
+            ))
+        })?;
+        if tip != generation || record.state != ChargeRecordState::Reserved {
+            return Ok(false);
+        }
+        let pending = terminal(
+            record,
+            ChargeRecordState::Pending,
+            Some(final_signature.to_string()),
+            None,
+        );
+        self.append(challenge_id, generation + 1, &pending).await
+    }
+
+    /// Record a terminal settlement failure for the `generation` returned by
+    /// [`Self::reserve`] (a reservation, or a pending broadcast being
+    /// reconciled).
+    ///
+    /// Returns `false`, writing nothing, when that generation is no longer
+    /// current: its lease was taken over or another outcome was recorded.
+    pub async fn mark_failed(
+        &self,
+        challenge_id: &str,
+        generation: u64,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let (tip, record) = self.tip(challenge_id).await?.ok_or_else(|| {
+            StoreError::Internal(format!(
+                "cannot settle charge record `{challenge_id}`: no reservation found"
+            ))
+        })?;
+        if tip != generation
+            || !matches!(
+                record.state,
+                ChargeRecordState::Reserved | ChargeRecordState::Pending
+            )
+        {
+            return Ok(false);
+        }
+        let failed = terminal(
+            record,
+            ChargeRecordState::Failed,
+            None,
+            Some(reason.to_string()),
+        );
+        self.append(challenge_id, generation + 1, &failed).await
+    }
+}
+
+fn terminal(
+    mut record: ChargeRecord,
+    state: ChargeRecordState,
+    final_signature: Option<String>,
+    failure_reason: Option<String>,
+) -> ChargeRecord {
+    record.state = state;
+    record.final_signature = final_signature;
+    record.failure_reason = failure_reason;
+    record.updated_at = now_unix();
+    record.expires_at = record.updated_at + DEFAULT_CHARGE_RECORD_RETENTION.as_secs() as i64;
+    record
 }
 
 // ── Channel store ──
@@ -702,6 +924,118 @@ pub struct ChannelState {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The deployment a channel record belongs to, stamped by the scheme that
+/// created it. Two ledgers that can name the same channel address (another
+/// payment scheme, recipient, cluster or program) refuse each other's records
+/// instead of accepting a voucher against the wrong one.
+///
+/// Persisted inside [`ChannelState::extra`], so stores and older readers carry
+/// it without a schema change. A field left `None` was not recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelBinding {
+    /// Payment scheme that owns the record (e.g. `batch-settlement`).
+    pub scheme: String,
+    /// Receiver the channel's distribution pays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_to: Option<String>,
+    /// Network the channel lives on, as the owning scheme names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Payment-channels program that owns the channel account (base58).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_id: Option<String>,
+}
+
+impl ChannelBinding {
+    /// The first recorded field `current` disagrees with, if any.
+    pub fn mismatch(&self, current: &ChannelBinding) -> Option<&'static str> {
+        fn differs(recorded: &Option<String>, current: &Option<String>) -> bool {
+            matches!((recorded, current), (Some(a), Some(b)) if a != b)
+        }
+        if self.scheme != current.scheme {
+            Some("scheme")
+        } else if differs(&self.pay_to, &current.pay_to) {
+            Some("payTo")
+        } else if differs(&self.network, &current.network) {
+            Some("network")
+        } else if differs(&self.program_id, &current.program_id) {
+            Some("programId")
+        } else {
+            None
+        }
+    }
+
+    /// This binding with any field it did not record taken from `current`.
+    pub fn filled_from(&self, current: &ChannelBinding) -> ChannelBinding {
+        ChannelBinding {
+            scheme: self.scheme.clone(),
+            pay_to: self.pay_to.clone().or_else(|| current.pay_to.clone()),
+            network: self.network.clone().or_else(|| current.network.clone()),
+            program_id: self
+                .program_id
+                .clone()
+                .or_else(|| current.program_id.clone()),
+        }
+    }
+}
+
+const CHANNEL_BINDING_KEY: &str = "channelBinding";
+
+impl ChannelState {
+    /// The deployment binding stamped on this record, if any.
+    pub fn binding(&self) -> Result<Option<ChannelBinding>, StoreError> {
+        self.extra
+            .get(CHANNEL_BINDING_KEY)
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|e| {
+                    StoreError::Internal(format!(
+                        "channel {} has an unreadable binding: {e}",
+                        self.channel_id
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Record `current` on a record that has no binding, or fill the fields an
+    /// older binding did not record.
+    pub fn adopt_binding(&mut self, current: &ChannelBinding) -> Result<(), StoreError> {
+        let recorded = self.binding()?;
+        let adopted = recorded
+            .as_ref()
+            .map_or_else(|| current.clone(), |recorded| recorded.filled_from(current));
+        if recorded.as_ref() != Some(&adopted) {
+            self.set_binding(&adopted);
+        }
+        Ok(())
+    }
+
+    /// Stamp `binding` on this record.
+    pub fn set_binding(&mut self, binding: &ChannelBinding) {
+        if let Ok(value) = serde_json::to_value(binding) {
+            self.extra.insert(CHANNEL_BINDING_KEY.to_string(), value);
+        }
+    }
+
+    /// Refuse a record bound to a different deployment. A record that
+    /// predates bindings carries none and is accepted.
+    ///
+    /// See [`Self::adopt_binding`] for completing an older binding.
+    pub fn check_binding(&self, current: &ChannelBinding) -> Result<(), StoreError> {
+        match self.binding()? {
+            Some(recorded) => match recorded.mismatch(current) {
+                Some(field) => Err(StoreError::Internal(format!(
+                    "channel {} belongs to another deployment ({field} differs)",
+                    self.channel_id
+                ))),
+                None => Ok(()),
+            },
+            None => Ok(()),
+        }
+    }
+}
+
 /// Cached result for one operator-signed `use` request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessedUse {
@@ -735,6 +1069,64 @@ pub struct ProcessedUse {
 /// authorization can never be served a second time.
 pub const MAX_COMMITTED_AUTHORIZATIONS: usize = 64;
 
+/// One request asking to reserve an authorization: it would step the channel's
+/// watermark by `amount` to the voucher's `cumulative`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRequest {
+    pub authorization_id: String,
+    pub request_fingerprint: String,
+    pub amount: u64,
+    pub cumulative: u64,
+    pub lease: Duration,
+    /// Unix seconds.
+    pub now: i64,
+}
+
+/// Proof that a store transition reserved one authorization stepping the
+/// watermark to `cumulative`.
+///
+/// Only [`ChannelState::reserve_authorization`] mints one, after its step
+/// check, and [`ChannelState::commit_authorization`] requires one, so no
+/// caller can commit work that was not reserved through that check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationToken {
+    authorization_id: String,
+    request_fingerprint: String,
+    cumulative: u64,
+    sequence: u64,
+}
+
+impl ReservationToken {
+    pub fn authorization_id(&self) -> &str {
+        &self.authorization_id
+    }
+
+    pub fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    /// The voucher cumulative this reservation commits to.
+    pub fn cumulative(&self) -> u64 {
+        self.cumulative
+    }
+}
+
+#[cfg(test)]
+impl ReservationToken {
+    /// The token for the reservation `id` already holds on `state`, as the
+    /// reserve that took it would have returned.
+    pub(crate) fn for_pending(state: &ChannelState, id: &str, fp: &str, cumulative: u64) -> Self {
+        Self {
+            authorization_id: id.to_string(),
+            request_fingerprint: fp.to_string(),
+            cumulative,
+            sequence: state
+                .pending_index(id)
+                .map_or(0, |index| state.pending_deliveries[index].sequence),
+        }
+    }
+}
+
 /// Outcome of [`ChannelState::reserve_authorization`].
 ///
 /// Mirrors [`ChargeReservation`]: only the caller that receives
@@ -742,14 +1134,14 @@ pub const MAX_COMMITTED_AUTHORIZATIONS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchReservation {
     /// This caller now owns the authorization: run the handler exactly once,
-    /// then either release it or commit it.
-    Reserved,
+    /// then either release it or commit it with the token.
+    Reserved(ReservationToken),
     /// A live reservation for this authorization is owned by another in-flight
     /// request. Do not run the handler; the client may retry shortly.
     InProgress,
-    /// An earlier attempt's handler already succeeded. Finish commitment and
-    /// return its result; never run the handler again.
-    HandlerSucceeded,
+    /// An earlier attempt's handler already succeeded. Finish commitment with
+    /// the token and return its result; never run the handler again.
+    HandlerSucceeded(ReservationToken),
     /// Already committed. Answer with the response stored on the record —
     /// see [`ChannelState::committed_authorization`].
     Committed,
@@ -770,6 +1162,14 @@ pub enum BatchReservation {
     /// falls only on a crashed or overrunning request, and it is the price of
     /// never serving a paid request twice.
     Abandoned,
+    /// The voucher does not step the current watermark by the reserved amount:
+    /// it was priced from a watermark another commit has since moved. Do not
+    /// serve it; the client re-signs from the current watermark.
+    Stale,
+    /// The channel is sealed or a close was requested: no new charge may start,
+    /// since the close finalizer seals the committed watermark once nothing is
+    /// reserved.
+    Closing,
 }
 
 impl ChannelState {
@@ -787,38 +1187,73 @@ impl ChannelState {
             .position(|entry| entry.delivery_id == authorization_id)
     }
 
-    /// Classify `authorization_id` without changing anything.
+    /// Classify `authorization_id` without changing anything; `None` when it
+    /// has no record and is free to reserve.
     ///
     /// `now` is unix seconds. A record whose fingerprint disagrees with
     /// `request_fingerprint` is a different request reusing the id, and is
     /// reported as [`BatchReservation::Conflict`] rather than served.
-    pub fn classify_authorization(
+    fn classify_authorization(
         &self,
         authorization_id: &str,
         request_fingerprint: &str,
+        cumulative: u64,
         now: i64,
-    ) -> BatchReservation {
+    ) -> Option<BatchReservation> {
         if let Some(committed) = self.committed_authorization(authorization_id) {
             if committed.request_fingerprint.as_deref() != Some(request_fingerprint) {
-                return BatchReservation::Conflict;
+                return Some(BatchReservation::Conflict);
             }
-            return BatchReservation::Committed;
+            return Some(BatchReservation::Committed);
         }
-        let Some(index) = self.pending_index(authorization_id) else {
-            return BatchReservation::Reserved;
-        };
+        let index = self.pending_index(authorization_id)?;
         let pending = &self.pending_deliveries[index];
-        if pending.request_fingerprint.as_deref() != Some(request_fingerprint) {
-            BatchReservation::Conflict
-        } else if pending.handler_succeeded {
-            // A succeeded handler outranks the lease. The work is already done;
-            // the only safe continuation is to finish committing it.
-            BatchReservation::HandlerSucceeded
-        } else if pending.expires_at > now {
-            BatchReservation::InProgress
-        } else {
-            BatchReservation::Abandoned
+        Some(
+            if pending.request_fingerprint.as_deref() != Some(request_fingerprint) {
+                BatchReservation::Conflict
+            } else if pending.handler_succeeded {
+                // A succeeded handler outranks the lease. The work is already
+                // done; the only safe continuation is to finish committing it.
+                BatchReservation::HandlerSucceeded(ReservationToken {
+                    authorization_id: authorization_id.to_string(),
+                    request_fingerprint: request_fingerprint.to_string(),
+                    cumulative,
+                    sequence: pending.sequence,
+                })
+            } else if pending.expires_at > now {
+                BatchReservation::InProgress
+            } else {
+                BatchReservation::Abandoned
+            },
+        )
+    }
+
+    /// Whether a later reservation was taken over this one's dead lease,
+    /// whether it is still pending or has already committed. Its work can no
+    /// longer be marked or committed: the later one stepped from the same
+    /// watermark.
+    fn is_superseded(&self, sequence: u64) -> bool {
+        self.next_delivery_sequence > sequence
+    }
+
+    /// The pending entry `token` was minted for.
+    fn token_pending_index(&self, token: &ReservationToken) -> Result<usize, StoreError> {
+        let index = self
+            .owned_pending_index(&token.authorization_id, &token.request_fingerprint)?
+            .filter(|&index| self.pending_deliveries[index].sequence == token.sequence)
+            .ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "authorization {} is no longer reserved",
+                    token.authorization_id
+                ))
+            })?;
+        if self.is_superseded(token.sequence) {
+            return Err(StoreError::Internal(format!(
+                "authorization {} outlived its lease and was superseded",
+                token.authorization_id
+            )));
         }
+        Ok(index)
     }
 
     /// The index of the reservation `request_fingerprint` owns, erroring when
@@ -855,53 +1290,124 @@ impl ChannelState {
     /// Only an authorization with no record at all is reservable. An existing
     /// reservation is never taken over, however long its lease has been
     /// dead — see [`BatchReservation::Abandoned`].
-    pub fn reserve_authorization(
+    ///
+    /// One cumulative step is in flight per channel: while another
+    /// authorization holds a live or handler-succeeded reservation this one is
+    /// [`BatchReservation::InProgress`]. Both would step from the same
+    /// watermark, and whichever committed second could only charge what was
+    /// left above the first.
+    ///
+    /// The request's `amount` must step the current watermark to its
+    /// `cumulative`; otherwise the reservation is [`BatchReservation::Stale`],
+    /// so a voucher priced from a watermark another commit has since moved is
+    /// never served. A sealed or closing channel is
+    /// [`BatchReservation::Closing`].
+    pub fn reserve_authorization(&mut self, request: &AuthorizationRequest) -> BatchReservation {
+        self.refuse_reservation(request)
+            .unwrap_or_else(|| self.take_reservation(request))
+    }
+
+    /// [`Self::reserve_authorization`] with a staged setup: `stage` reads the
+    /// record and returns the pending setup to install, which is applied only
+    /// together with a [`BatchReservation::Reserved`] outcome. Any other
+    /// outcome, or an error from `stage`, leaves the record untouched.
+    pub fn reserve_authorization_staged(
         &mut self,
-        authorization_id: &str,
-        request_fingerprint: &str,
-        amount: u64,
-        lease: Duration,
-        now: i64,
-    ) -> BatchReservation {
-        let outcome = self.classify_authorization(authorization_id, request_fingerprint, now);
-        if outcome != BatchReservation::Reserved {
-            return outcome;
+        request: &AuthorizationRequest,
+        stage: impl FnOnce(&Self) -> Result<Option<PendingSetup>, StoreError>,
+    ) -> Result<BatchReservation, StoreError> {
+        if let Some(refused) = self.refuse_reservation(request) {
+            return Ok(refused);
         }
+        if let Some(setup) = stage(self)? {
+            self.pending_setup = Some(setup);
+        }
+        Ok(self.take_reservation(request))
+    }
+
+    /// The outcome when `request` cannot take a new reservation; `None` when
+    /// it can. Reads only.
+    fn refuse_reservation(&self, request: &AuthorizationRequest) -> Option<BatchReservation> {
+        let AuthorizationRequest {
+            authorization_id,
+            request_fingerprint,
+            amount,
+            cumulative,
+            now,
+            ..
+        } = request;
+        let (amount, cumulative, now) = (*amount, *cumulative, *now);
+        if self.sealed || self.close_requested_at.is_some() {
+            return Some(BatchReservation::Closing);
+        }
+        if let Some(outcome) =
+            self.classify_authorization(authorization_id, request_fingerprint, cumulative, now)
+        {
+            return Some(outcome);
+        }
+        if self.pending_deliveries.iter().any(|pending| {
+            pending.delivery_id != *authorization_id
+                && (pending.handler_succeeded || pending.expires_at > now)
+        }) {
+            return Some(BatchReservation::InProgress);
+        }
+        if self.cumulative.checked_add(amount) != Some(cumulative) {
+            return Some(BatchReservation::Stale);
+        }
+        None
+    }
+
+    /// Take the reservation [`Self::refuse_reservation`] cleared.
+    fn take_reservation(&mut self, request: &AuthorizationRequest) -> BatchReservation {
+        let AuthorizationRequest {
+            authorization_id,
+            request_fingerprint,
+            amount,
+            cumulative,
+            lease,
+            now,
+        } = request;
+        let (amount, cumulative, now) = (*amount, *cumulative, *now);
         self.prune_authorizations(now);
         self.next_delivery_sequence = self.next_delivery_sequence.saturating_add(1);
+        let sequence = self.next_delivery_sequence;
         self.pending_deliveries.push(PendingDelivery {
-            delivery_id: authorization_id.to_string(),
+            delivery_id: authorization_id.clone(),
             amount,
-            sequence: self.next_delivery_sequence,
+            sequence,
             // Past this the reservation is suspect rather than free: a retry is
             // refused instead of taking it over.
             expires_at: now.saturating_add(lease.as_secs() as i64),
-            request_fingerprint: Some(request_fingerprint.to_string()),
+            request_fingerprint: Some(request_fingerprint.clone()),
             handler_succeeded: false,
         });
-        BatchReservation::Reserved
+        BatchReservation::Reserved(ReservationToken {
+            authorization_id: authorization_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            cumulative,
+            sequence,
+        })
     }
 
     /// Record that the resource handler for `authorization_id` succeeded.
     ///
     /// This is the crash boundary: after it, no retry may run the handler
     /// again, only finish commitment.
+    ///
+    /// A reservation superseded over its dead lease is refused, so it can
+    /// never come to block the channel as handler-succeeded.
     pub fn mark_authorization_handler_succeeded(
         &mut self,
-        authorization_id: &str,
-        request_fingerprint: &str,
+        token: &ReservationToken,
     ) -> Result<(), StoreError> {
         // Already committed: the handler ran and its result is durable.
-        if self.committed_authorization(authorization_id).is_some() {
+        if self
+            .committed_authorization(&token.authorization_id)
+            .is_some()
+        {
             return Ok(());
         }
-        let index = self
-            .owned_pending_index(authorization_id, request_fingerprint)?
-            .ok_or_else(|| {
-                StoreError::Internal(format!(
-                    "authorization {authorization_id} is no longer reserved"
-                ))
-            })?;
+        let index = self.token_pending_index(token)?;
         self.pending_deliveries[index].handler_succeeded = true;
         Ok(())
     }
@@ -937,32 +1443,28 @@ impl ChannelState {
     /// Idempotent — committing an already-committed authorization leaves the
     /// stored response in place, so a retried transition (a CAS store re-running
     /// its updater) cannot charge twice.
-    #[allow(clippy::too_many_arguments)]
     pub fn commit_authorization(
         &mut self,
-        authorization_id: &str,
-        request_fingerprint: &str,
-        cumulative: u64,
+        token: &ReservationToken,
         voucher_signature: &str,
         voucher_expires_at: i64,
         now: i64,
         response: impl FnOnce(&Self) -> Option<serde_json::Value>,
     ) -> Result<(), StoreError> {
+        let authorization_id = token.authorization_id.as_str();
+        let request_fingerprint = token.request_fingerprint.as_str();
+        let cumulative = token.cumulative;
         if let Some(committed) = self.committed_authorization(authorization_id) {
-            if committed.request_fingerprint.as_deref() != Some(request_fingerprint) {
+            if committed.request_fingerprint.as_deref() != Some(request_fingerprint)
+                || committed.cumulative != cumulative
+            {
                 return Err(StoreError::Internal(format!(
                     "authorization {authorization_id} was committed by a different request"
                 )));
             }
             return Ok(());
         }
-        let index = self
-            .owned_pending_index(authorization_id, request_fingerprint)?
-            .ok_or_else(|| {
-                StoreError::Internal(format!(
-                    "authorization {authorization_id} is no longer reserved"
-                ))
-            })?;
+        let index = self.token_pending_index(token)?;
         // The counterpart of `has_blocking_authorization`: once the finalizer
         // has chosen the amount to seal at (`freeze_watermark_at`), or the
         // seal has landed, the watermark is frozen and a charge written now
@@ -987,6 +1489,17 @@ impl ChannelState {
         if cumulative < self.cumulative {
             return Err(StoreError::Internal(format!(
                 "authorization {authorization_id} would lower the watermark from {} to {cumulative}",
+                self.cumulative
+            )));
+        }
+        // The reservation priced one step from the watermark it was taken at;
+        // if another commit moved it since, this voucher no longer pays for
+        // the step it reserved.
+        let reserved = self.pending_deliveries[index].amount;
+        if self.cumulative.checked_add(reserved) != Some(cumulative) {
+            return Err(StoreError::Internal(format!(
+                "authorization {authorization_id} reserved {reserved} above the watermark, \
+                 which is now {} and does not step to {cumulative}",
                 self.cumulative
             )));
         }
@@ -1126,6 +1639,18 @@ impl ChannelState {
     }
 }
 
+/// An atomic in-place step on one channel record.
+pub type ChannelMutator = Box<dyn FnOnce(&mut ChannelState) -> Result<(), StoreError> + Send>;
+
+/// Borrowing reader passed to [`ChannelStore::read_channel`].
+pub type ChannelReader = Box<dyn FnOnce(Option<&ChannelState>) -> Result<(), StoreError> + Send>;
+
+/// Reads a channel record and returns the pending setup a reservation should
+/// install with it; see [`ChannelState::reserve_authorization_staged`]. It
+/// cannot write, so a refused reservation leaves nothing behind.
+pub type ReservationStage =
+    Box<dyn FnOnce(&ChannelState) -> Result<Option<PendingSetup>, StoreError> + Send>;
+
 /// Async store for channel state with compare-and-swap watermark advancement.
 ///
 /// Implementations MUST guarantee that `advance_cumulative` is atomic to
@@ -1214,7 +1739,7 @@ pub trait ChannelStore: Send + Sync {
     fn read_channel(
         &self,
         channel_id: &str,
-        reader: Box<dyn FnOnce(Option<&ChannelState>) -> Result<(), StoreError> + Send>,
+        reader: ChannelReader,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
     /// Atomically mutate channel state in place, without cloning the record.
@@ -1233,8 +1758,42 @@ pub trait ChannelStore: Send + Sync {
         &self,
         channel_id: &str,
         seed: Option<ChannelState>,
-        mutator: Box<dyn FnOnce(&mut ChannelState) -> Result<(), StoreError> + Send>,
+        mutator: ChannelMutator,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
+    /// Atomically check and reserve one authorization on `channel_id`.
+    ///
+    /// One transition runs [`ChannelState::reserve_authorization_staged`]:
+    /// its close fence and watermark step check decide the outcome, `prepare`
+    /// (which may refuse by erroring) stages a setup applied only with a
+    /// reservation, and a commit needs the token only that check mints. An
+    /// override MUST keep all of it in one atomic read-modify-write and leave a
+    /// refused record unchanged; [`conformance`] exercises it.
+    fn reserve_authorization(
+        &self,
+        channel_id: &str,
+        seed: Option<ChannelState>,
+        request: AuthorizationRequest,
+        prepare: ReservationStage,
+    ) -> Pin<Box<dyn Future<Output = Result<BatchReservation, StoreError>> + Send + '_>> {
+        let channel_id = channel_id.to_string();
+        Box::pin(async move {
+            let out = Arc::new(std::sync::Mutex::new(None));
+            let sink = Arc::clone(&out);
+            self.mutate_channel(
+                &channel_id,
+                seed,
+                Box::new(move |state| {
+                    let outcome = state.reserve_authorization_staged(&request, prepare)?;
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+                    Ok(())
+                }),
+            )
+            .await?;
+            let outcome = out.lock().unwrap_or_else(|e| e.into_inner()).take();
+            outcome.ok_or_else(|| StoreError::Internal("reservation did not run".to_string()))
+        })
+    }
 
     /// Persist an idle-close deadline without allowing an older touch to move
     /// an existing deadline backwards. Once close is claimed or the channel is
@@ -1341,6 +1900,16 @@ where
         mutator: Box<dyn FnOnce(&mut ChannelState) -> Result<(), StoreError> + Send>,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         (**self).mutate_channel(channel_id, seed, mutator)
+    }
+
+    fn reserve_authorization(
+        &self,
+        channel_id: &str,
+        seed: Option<ChannelState>,
+        request: AuthorizationRequest,
+        prepare: ReservationStage,
+    ) -> Pin<Box<dyn Future<Output = Result<BatchReservation, StoreError>> + Send + '_>> {
+        (**self).reserve_authorization(channel_id, seed, request, prepare)
     }
 
     fn touch_channel_lifecycle(
@@ -2123,6 +2692,371 @@ impl ChannelStore for RedisChannelStore {
     }
 }
 
+/// Behaviour every [`ChannelStore`] implementation must show, as one suite
+/// each implementation's tests run.
+#[cfg(any(test, feature = "testkit"))]
+pub mod conformance {
+    use super::*;
+
+    const LEASE: Duration = CHARGE_RESERVATION_LEASE;
+
+    fn request(id: &str, amount: u64, cumulative: u64, now: i64) -> AuthorizationRequest {
+        AuthorizationRequest {
+            authorization_id: id.to_string(),
+            request_fingerprint: format!("fp-{id}"),
+            amount,
+            cumulative,
+            lease: LEASE,
+            now,
+        }
+    }
+
+    async fn reserve(
+        store: &dyn ChannelStore,
+        channel_id: &str,
+        request: AuthorizationRequest,
+    ) -> BatchReservation {
+        store
+            .reserve_authorization(channel_id, None, request, Box::new(|_| Ok(None)))
+            .await
+            .unwrap()
+    }
+
+    async fn commit(store: &dyn ChannelStore, channel_id: &str, token: &ReservationToken) {
+        let token = token.clone();
+        store
+            .mutate_channel(
+                channel_id,
+                None,
+                Box::new(move |state| {
+                    state.mark_authorization_handler_succeeded(&token)?;
+                    state.commit_authorization(&token, "sig", 0, 100, |_| None)
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn token(outcome: BatchReservation) -> ReservationToken {
+        match outcome {
+            BatchReservation::Reserved(token) => token,
+            other => panic!("expected a reservation, got {other:?}"),
+        }
+    }
+
+    /// An open channel record with a 10_000 deposit and a zero watermark.
+    pub fn channel_state(channel_id: &str) -> ChannelState {
+        let deposit = 10_000;
+        ChannelState {
+            channel_id: channel_id.to_string(),
+            authorized_signer: "signer1".to_string(),
+            deposit,
+            cumulative: 0,
+            sealed: false,
+            highest_voucher_signature: None,
+            highest_voucher_expires_at: None,
+            close_requested_at: None,
+            final_cumulative: None,
+            open_slot: None,
+            payer: String::new(),
+            rent_payer: String::new(),
+            opening_challenge_id: String::new(),
+            authentication: None,
+            voucher_signer: "client".to_string(),
+            idle_timeout_seconds: None,
+            last_activity_at: 0,
+            spent_amount: 0,
+            settled_on_chain: 0,
+            distributed_on_chain: 0,
+            processed_uses: vec![],
+            processed_topup_signatures: vec![],
+            next_delivery_sequence: 0,
+            pending_deliveries: vec![],
+            committed_deliveries: Default::default(),
+            pending_setup: None,
+            onchain_checked_at: 0,
+            lifecycle: None,
+            schema_version: CHANNEL_STATE_SCHEMA_VERSION,
+            extra: Default::default(),
+        }
+    }
+
+    /// The [`Store`] contract: conditional writes are atomic and exact.
+    pub async fn check_store(store: &dyn Store) {
+        let key = "conformance-store-cas";
+        let v1 = serde_json::json!({ "v": 1 });
+        let v2 = serde_json::json!({ "v": 2 });
+        let v3 = serde_json::json!({ "v": 3 });
+        assert!(!store
+            .put_if_eq(key, Some(v1.clone()), v2.clone())
+            .await
+            .unwrap());
+        assert_eq!(store.get(key).await.unwrap(), None);
+        assert!(store.put_if_eq(key, None, v1.clone()).await.unwrap());
+        assert!(!store.put_if_eq(key, None, v2.clone()).await.unwrap());
+        assert!(!store
+            .put_if_eq(key, Some(v3.clone()), v2.clone())
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_eq(key, Some(v1.clone()), v2.clone())
+            .await
+            .unwrap());
+        assert_eq!(store.get(key).await.unwrap(), Some(v2.clone()));
+        assert!(!store.put_if_absent(key, v3.clone()).await.unwrap());
+
+        // Writers racing from the same read: exactly one lands.
+        let (left, right) = tokio::join!(
+            store.put_if_eq(key, Some(v2.clone()), serde_json::json!({ "v": "left" })),
+            store.put_if_eq(key, Some(v2.clone()), serde_json::json!({ "v": "right" })),
+        );
+        assert_eq!(
+            [left.unwrap(), right.unwrap()]
+                .iter()
+                .filter(|won| **won)
+                .count(),
+            1
+        );
+    }
+
+    /// Run the suite. `fresh` builds an open channel record with a deposit of
+    /// at least 10_000 and a zero watermark that `store` accepts.
+    pub async fn check_channel_store(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        refuses_a_reservation_from_a_moved_watermark(store, fresh).await;
+        refuses_a_reservation_superseded_over_its_dead_lease(store, fresh).await;
+        refuses_reservations_on_a_closing_channel(store, fresh).await;
+        a_refused_preparation_reserves_nothing(store, fresh).await;
+        a_refused_reservation_leaves_the_record_unchanged(store, fresh).await;
+    }
+
+    /// Two replicas price vouchers from the same watermark and the first
+    /// commits before the second reserves: the second is refused before it is
+    /// served, and leaves nothing that blocks the channel.
+    async fn refuses_a_reservation_from_a_moved_watermark(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        let id = "conformance-moved";
+        store.put_channel(id, fresh(id)).await.unwrap();
+        let a = token(reserve(store, id, request("a", 500, 500, 100)).await);
+        assert_eq!(
+            reserve(store, id, request("b", 2_000, 2_000, 100)).await,
+            BatchReservation::InProgress
+        );
+        commit(store, id, &a).await;
+        assert_eq!(
+            reserve(store, id, request("b", 2_000, 2_000, 100)).await,
+            BatchReservation::Stale
+        );
+        let state = store.get_channel(id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 500);
+        assert!(state.pending_deliveries.is_empty());
+        let b = token(reserve(store, id, request("b2", 1_500, 2_000, 100)).await);
+        commit(store, id, &b).await;
+        assert_eq!(
+            store.get_channel(id).await.unwrap().unwrap().cumulative,
+            2_000
+        );
+    }
+
+    /// A reservation whose lease ran out may be superseded; the overrunning
+    /// one can then neither commit nor come to block the channel.
+    async fn refuses_a_reservation_superseded_over_its_dead_lease(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        let id = "conformance-lease";
+        store.put_channel(id, fresh(id)).await.unwrap();
+        let slow = token(reserve(store, id, request("slow", 500, 500, 100)).await);
+        let after_lease = 100 + LEASE.as_secs() as i64 + 1;
+        let next = token(reserve(store, id, request("next", 700, 700, after_lease)).await);
+        let late = slow.clone();
+        assert!(store
+            .mutate_channel(
+                id,
+                None,
+                Box::new(move |state| state.mark_authorization_handler_succeeded(&late)),
+            )
+            .await
+            .is_err());
+        let late = slow.clone();
+        assert!(store
+            .mutate_channel(
+                id,
+                None,
+                Box::new(move |state| state.commit_authorization(&late, "sig", 0, 100, |_| None)),
+            )
+            .await
+            .is_err());
+        commit(store, id, &next).await;
+        assert_eq!(
+            store.get_channel(id).await.unwrap().unwrap().cumulative,
+            700
+        );
+
+        // The superseding reservation commits before the slow handler returns:
+        // the slow one is still refused at mark, so it never comes to block
+        // the channel as handler-succeeded.
+        let id = "conformance-lease-committed";
+        store.put_channel(id, fresh(id)).await.unwrap();
+        let slow = token(reserve(store, id, request("slow", 500, 500, 100)).await);
+        let next = token(reserve(store, id, request("next", 700, 700, after_lease)).await);
+        commit(store, id, &next).await;
+        let late = slow.clone();
+        assert!(store
+            .mutate_channel(
+                id,
+                None,
+                Box::new(move |state| state.mark_authorization_handler_succeeded(&late)),
+            )
+            .await
+            .is_err());
+        assert!(matches!(
+            reserve(store, id, request("after", 300, 1_000, after_lease)).await,
+            BatchReservation::Reserved(_)
+        ));
+    }
+
+    async fn refuses_reservations_on_a_closing_channel(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        let id = "conformance-closing";
+        let mut state = fresh(id);
+        state.close_requested_at = Some(1);
+        store.put_channel(id, state).await.unwrap();
+        assert_eq!(
+            reserve(store, id, request("a", 500, 500, 100)).await,
+            BatchReservation::Closing
+        );
+        assert!(store
+            .get_channel(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_deliveries
+            .is_empty());
+    }
+
+    async fn a_refused_preparation_reserves_nothing(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        let id = "conformance-prepare";
+        store.put_channel(id, fresh(id)).await.unwrap();
+        assert!(store
+            .reserve_authorization(
+                id,
+                None,
+                request("a", 500, 500, 100),
+                Box::new(|_| Err(StoreError::Internal("refused".to_string()))),
+            )
+            .await
+            .is_err());
+        assert!(store
+            .get_channel(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_deliveries
+            .is_empty());
+    }
+
+    fn staged_setup(signature: &str) -> ReservationStage {
+        let signature = signature.to_string();
+        Box::new(move |_| {
+            Ok(Some(PendingSetup {
+                payer_signature: signature,
+                deposit: 1_000,
+                opens_channel: false,
+                expires_at: i64::MAX,
+            }))
+        })
+    }
+
+    async fn snapshot(store: &dyn ChannelStore, id: &str) -> serde_json::Value {
+        serde_json::to_value(store.get_channel(id).await.unwrap().unwrap()).unwrap()
+    }
+
+    /// Whatever refuses a reservation (a moved watermark, another request in
+    /// flight, a closing channel), the setup it staged is never written, so a
+    /// later reservation is not blocked by it.
+    async fn a_refused_reservation_leaves_the_record_unchanged(
+        store: &dyn ChannelStore,
+        fresh: &(dyn Fn(&str) -> ChannelState + Sync),
+    ) {
+        let id = "conformance-refused";
+        store.put_channel(id, fresh(id)).await.unwrap();
+        let first = token(reserve(store, id, request("a", 500, 500, 100)).await);
+        commit(store, id, &first).await;
+
+        let before = snapshot(store, id).await;
+        let stale = store
+            .reserve_authorization(
+                id,
+                None,
+                request("stale", 1_000, 1_000, 100),
+                staged_setup("topup-stale"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale, BatchReservation::Stale);
+        assert_eq!(snapshot(store, id).await, before);
+
+        let held = token(reserve(store, id, request("held", 500, 1_000, 100)).await);
+        let before = snapshot(store, id).await;
+        let busy = store
+            .reserve_authorization(
+                id,
+                None,
+                request("busy", 1_000, 2_000, 100),
+                staged_setup("topup-busy"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(busy, BatchReservation::InProgress);
+        assert_eq!(snapshot(store, id).await, before);
+        commit(store, id, &held).await;
+
+        // A fresh reservation still installs its own staged setup.
+        let fresh_topup = store
+            .reserve_authorization(
+                id,
+                None,
+                request("fresh", 500, 1_500, 100),
+                staged_setup("topup-fresh"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(fresh_topup, BatchReservation::Reserved(_)));
+        let state = store.get_channel(id).await.unwrap().unwrap();
+        assert_eq!(
+            state.pending_setup.map(|setup| setup.payer_signature),
+            Some("topup-fresh".to_string())
+        );
+
+        let closing = "conformance-refused-closing";
+        let mut state = fresh(closing);
+        state.close_requested_at = Some(1);
+        store.put_channel(closing, state).await.unwrap();
+        let before = snapshot(store, closing).await;
+        let refused = store
+            .reserve_authorization(
+                closing,
+                None,
+                request("a", 500, 500, 100),
+                staged_setup("topup-closing"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused, BatchReservation::Closing);
+        assert_eq!(snapshot(store, closing).await, before);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,7 +3099,7 @@ mod tests {
             .reserve("chal-1", "digest-a", CHARGE_RESERVATION_LEASE)
             .await
             .unwrap();
-        assert_eq!(outcome, ChargeReservation::Reserved);
+        assert_eq!(outcome, ChargeReservation::Reserved { generation: 0 });
     }
 
     #[tokio::test]
@@ -2216,10 +3150,10 @@ mod tests {
             .reserve("chal-4", "digest-a", CHARGE_RESERVATION_LEASE)
             .await
             .unwrap();
-        store
-            .mark_failed("chal-4", "simulation failed")
+        assert!(store
+            .mark_failed("chal-4", 0, "simulation failed")
             .await
-            .unwrap();
+            .unwrap());
 
         let outcome = store
             .reserve("chal-4", "digest-a", CHARGE_RESERVATION_LEASE)
@@ -2229,6 +3163,135 @@ mod tests {
             outcome,
             ChargeReservation::AlreadyFailed {
                 reason: "simulation failed".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn charge_replay_pending_record_hands_back_its_signature() {
+        let store = replay_store();
+        let ChargeReservation::Reserved { generation } = store
+            .reserve("chal-p", "digest-a", Duration::from_secs(0))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a fresh reservation");
+        };
+        assert!(store
+            .mark_pending("chal-p", generation, "sig-pending")
+            .await
+            .unwrap());
+        // Only the reservation's owner records the broadcast.
+        assert!(!store
+            .mark_pending("chal-p", generation, "sig-other")
+            .await
+            .unwrap());
+
+        // Never lease-reclaimed into a fresh settlement: the broadcast may land.
+        let outcome = store
+            .reserve("chal-p", "digest-a", Duration::from_secs(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ChargeReservation::PendingConfirmation {
+                generation: generation + 1,
+                final_signature: "sig-pending".to_string()
+            }
+        );
+        let outcome = store
+            .reserve("chal-p", "digest-b", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ChargeReservation::Conflict);
+
+        store.mark_confirmed("chal-p", "sig-pending").await.unwrap();
+        let outcome = store
+            .reserve("chal-p", "digest-a", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ChargeReservation::AlreadyConfirmed {
+                final_signature: "sig-pending".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn charge_replay_pending_confirmation_has_one_winner() {
+        let store = replay_store();
+        let ChargeReservation::Reserved { generation } = store
+            .reserve("chal-pc", "digest-a", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a fresh reservation");
+        };
+        assert!(store
+            .mark_pending("chal-pc", generation, "sig-pending")
+            .await
+            .unwrap());
+        let pending = generation + 1;
+        // Only the recorded signature at the current generation confirms.
+        assert!(!store
+            .confirm_pending("chal-pc", generation, "sig-pending")
+            .await
+            .unwrap());
+        assert!(!store
+            .confirm_pending("chal-pc", pending, "sig-other")
+            .await
+            .unwrap());
+        assert!(store
+            .confirm_pending("chal-pc", pending, "sig-pending")
+            .await
+            .unwrap());
+        // A concurrent reconciler of the same pending generation loses.
+        assert!(!store
+            .confirm_pending("chal-pc", pending, "sig-pending")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .reserve("chal-pc", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::AlreadyConfirmed {
+                final_signature: "sig-pending".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn charge_replay_pending_record_fails_only_for_its_generation() {
+        let store = replay_store();
+        let ChargeReservation::Reserved { generation } = store
+            .reserve("chal-pf", "digest-a", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a fresh reservation");
+        };
+        assert!(store
+            .mark_pending("chal-pf", generation, "sig-pending")
+            .await
+            .unwrap());
+        // The reservation generation is superseded by the pending one.
+        assert!(!store
+            .mark_failed("chal-pf", generation, "stale")
+            .await
+            .unwrap());
+        assert!(store
+            .mark_failed("chal-pf", generation + 1, "expired without landing")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .reserve("chal-pf", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::AlreadyFailed {
+                reason: "expired without landing".to_string()
             }
         );
     }
@@ -2273,7 +3336,7 @@ mod tests {
             .reserve("chal-6", "digest-a", CHARGE_RESERVATION_LEASE)
             .await
             .unwrap();
-        assert_eq!(outcome, ChargeReservation::Reserved);
+        assert_eq!(outcome, ChargeReservation::Reserved { generation: 1 });
     }
 
     #[tokio::test]
@@ -2284,6 +3347,194 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn charge_replay_stale_owner_cannot_overwrite_a_takeover() {
+        let store = replay_store();
+        // Owner A's lease has expired while it is still settling.
+        let stale = store
+            .reserve("chal-stale", "digest-a", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(stale, ChargeReservation::Reserved { generation: 0 });
+        let takeover = store
+            .reserve("chal-stale", "digest-a", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        assert_eq!(takeover, ChargeReservation::Reserved { generation: 1 });
+
+        // While B holds the takeover, A's late failure is fenced out.
+        assert!(!store
+            .mark_failed("chal-stale", 0, "stale-worker-rpc-timeout")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .reserve("chal-stale", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::InProgress
+        );
+
+        store
+            .mark_confirmed("chal-stale", "newer-worker-signature")
+            .await
+            .unwrap();
+        // Neither the stale owner nor the confirmed owner can fail it now.
+        assert!(!store
+            .mark_failed("chal-stale", 0, "stale-worker-rpc-timeout")
+            .await
+            .unwrap());
+        assert!(!store.mark_failed("chal-stale", 1, "late").await.unwrap());
+        assert_eq!(
+            store
+                .reserve("chal-stale", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::AlreadyConfirmed {
+                final_signature: "newer-worker-signature".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn charge_replay_confirmed_record_survives_a_stale_failure() {
+        let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store = ChargeReplayStore::new(raw.clone());
+        assert_eq!(
+            store
+                .reserve("chal-keep", "same-credential", Duration::ZERO)
+                .await
+                .unwrap(),
+            ChargeReservation::Reserved { generation: 0 }
+        );
+        assert_eq!(
+            store
+                .reserve("chal-keep", "same-credential", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::Reserved { generation: 1 }
+        );
+        store
+            .mark_confirmed("chal-keep", "confirmed-by-reclaimer")
+            .await
+            .unwrap();
+        assert!(!store
+            .mark_failed("chal-keep", 0, "stale-owner-settlement-error")
+            .await
+            .unwrap());
+
+        // The confirmed generation is the latest one, with its signature.
+        assert!(raw
+            .get("solana-charge:record:chal-keep:3")
+            .await
+            .unwrap()
+            .is_none());
+        let record: ChargeRecord = serde_json::from_value(
+            raw.get("solana-charge:record:chal-keep:2")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.state, ChargeRecordState::Confirmed);
+        assert_eq!(
+            record.final_signature.as_deref(),
+            Some("confirmed-by-reclaimer")
+        );
+        assert_eq!(record.failure_reason, None);
+        assert_eq!(
+            store
+                .reserve("chal-keep", "same-credential", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::AlreadyConfirmed {
+                final_signature: "confirmed-by-reclaimer".to_string()
+            }
+        );
+
+        // The current owner of a live reservation still records its failure.
+        store
+            .reserve("chal-own", "same-credential", CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        assert!(store
+            .mark_failed("chal-own", 0, "simulation failed")
+            .await
+            .unwrap());
+        assert!(!store
+            .mark_failed("chal-own", 0, "second failure")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn charge_replay_late_confirmation_supersedes_a_failure() {
+        let store = replay_store();
+        store
+            .reserve("chal-late", "digest-a", Duration::ZERO)
+            .await
+            .unwrap();
+        // B takes over and fails (e.g. A's signature was already consumed).
+        assert_eq!(
+            store
+                .reserve("chal-late", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::Reserved { generation: 1 }
+        );
+        assert!(store
+            .mark_failed("chal-late", 1, "signature already consumed")
+            .await
+            .unwrap());
+        // A's settlement did land: the on-chain fact wins.
+        store.mark_confirmed("chal-late", "sig-a").await.unwrap();
+        store
+            .mark_confirmed("chal-late", "sig-other")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve("chal-late", "digest-a", CHARGE_RESERVATION_LEASE)
+                .await
+                .unwrap(),
+            ChargeReservation::AlreadyConfirmed {
+                final_signature: "sig-a".to_string()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn charge_replay_concurrent_takeover_of_expired_lease_wins_exactly_once() {
+        const TASKS: usize = 16;
+        let store = Arc::new(replay_store());
+        store
+            .reserve("chal-takeover", "digest-a", Duration::ZERO)
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .reserve("chal-takeover", "digest-a", CHARGE_RESERVATION_LEASE)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winners = Vec::new();
+        for handle in handles {
+            match handle.await.unwrap() {
+                ChargeReservation::Reserved { generation } => winners.push(generation),
+                ChargeReservation::InProgress => {}
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(winners, vec![1]);
     }
 
     // Concurrency regression: race N tasks reserving the SAME challenge
@@ -2314,7 +3565,7 @@ mod tests {
         let mut in_progress = 0usize;
         for handle in handles {
             match handle.await.expect("task panicked") {
-                ChargeReservation::Reserved => reserved += 1,
+                ChargeReservation::Reserved { .. } => reserved += 1,
                 ChargeReservation::InProgress => in_progress += 1,
                 other => panic!("unexpected outcome: {other:?}"),
             }
@@ -2395,20 +3646,35 @@ mod tests {
 
     const LEASE: Duration = CHARGE_RESERVATION_LEASE;
 
+    fn req(id: &str, fp: &str, amount: u64, cumulative: u64, now: i64) -> AuthorizationRequest {
+        AuthorizationRequest {
+            authorization_id: id.to_string(),
+            request_fingerprint: fp.to_string(),
+            amount,
+            cumulative,
+            lease: LEASE,
+            now,
+        }
+    }
+
+    fn token_for(state: &ChannelState, id: &str, fp: &str, cumulative: u64) -> ReservationToken {
+        ReservationToken::for_pending(state, id, fp, cumulative)
+    }
+
     /// A handler failure releases the authorization, and the same request may
     /// then reserve it again — the retry the client is entitled to.
     #[test]
     fn a_released_authorization_is_reservable_again() {
         let mut state = make_state("c1", 10_000);
         let reserve = |state: &mut ChannelState| {
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100)
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100))
         };
-        assert_eq!(reserve(&mut state), BatchReservation::Reserved);
+        assert!(matches!(reserve(&mut state), BatchReservation::Reserved(_)));
         // A second attempt while the first is live must not run the handler.
         assert_eq!(reserve(&mut state), BatchReservation::InProgress);
 
         state.release_authorization("access:c1:1000", "fp").unwrap();
-        assert_eq!(reserve(&mut state), BatchReservation::Reserved);
+        assert!(matches!(reserve(&mut state), BatchReservation::Reserved(_)));
         assert_eq!(
             state.cumulative, 0,
             "a released authorization charges nothing"
@@ -2420,22 +3686,22 @@ mod tests {
     #[test]
     fn a_succeeded_handler_outranks_its_lease() {
         let mut state = make_state("c1", 10_000);
-        state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100);
+        state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100));
         state
-            .mark_authorization_handler_succeeded("access:c1:1000", "fp")
+            .mark_authorization_handler_succeeded(&token_for(&state, "access:c1:1000", "fp", 0))
             .unwrap();
 
         let after_lease = 100 + LEASE.as_secs() as i64 + 1;
-        assert_eq!(
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, after_lease),
-            BatchReservation::HandlerSucceeded
-        );
+        assert!(matches!(
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, after_lease)),
+            BatchReservation::HandlerSucceeded(_)
+        ));
         // And it is not swept as an abandoned reservation.
         state.prune_authorizations(after_lease);
-        assert_eq!(
-            state.classify_authorization("access:c1:1000", "fp", after_lease),
-            BatchReservation::HandlerSucceeded
-        );
+        assert!(matches!(
+            state.classify_authorization("access:c1:1000", "fp", 1_000, after_lease),
+            Some(BatchReservation::HandlerSucceeded(_))
+        ));
         // Releasing it would let the same voucher serve twice.
         assert!(state.release_authorization("access:c1:1000", "fp").is_err());
     }
@@ -2450,14 +3716,14 @@ mod tests {
             "a settled record is droppable"
         );
 
-        state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100);
+        state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100));
         assert!(
             state.has_in_flight_authorization(),
             "a reservation must be kept"
         );
 
         state
-            .mark_authorization_handler_succeeded("access:c1:1000", "fp")
+            .mark_authorization_handler_succeeded(&token_for(&state, "access:c1:1000", "fp", 0))
             .unwrap();
         assert!(
             state.has_in_flight_authorization(),
@@ -2465,7 +3731,13 @@ mod tests {
         );
 
         state
-            .commit_authorization("access:c1:1000", "fp", 1_000, "sig", 0, 100, |_| None)
+            .commit_authorization(
+                &token_for(&state, "access:c1:1000", "fp", 1_000),
+                "sig",
+                0,
+                100,
+                |_| None,
+            )
             .unwrap();
         assert!(
             !state.has_in_flight_authorization(),
@@ -2488,15 +3760,15 @@ mod tests {
     #[test]
     fn an_abandoned_reservation_is_never_served_again() {
         let mut state = make_state("c1", 10_000);
-        assert_eq!(
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100),
-            BatchReservation::Reserved
-        );
+        assert!(matches!(
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100)),
+            BatchReservation::Reserved(_)
+        ));
 
         // Its owner crashed mid-request: no release, no success marker.
         let after_lease = 100 + LEASE.as_secs() as i64 + 1;
         assert_eq!(
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, after_lease),
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, after_lease)),
             BatchReservation::Abandoned,
             "an unreported reservation must never be taken over"
         );
@@ -2504,7 +3776,7 @@ mod tests {
         // Pruning must not launder it into a fresh reservation either.
         state.prune_authorizations(after_lease);
         assert_eq!(
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, after_lease),
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, after_lease)),
             BatchReservation::Abandoned
         );
         assert_eq!(state.cumulative, 0, "and it is never charged");
@@ -2515,20 +3787,26 @@ mod tests {
     #[test]
     fn a_committed_authorization_replays_its_stored_response() {
         let mut state = make_state("c1", 10_000);
-        state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100);
+        state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100));
         state
-            .mark_authorization_handler_succeeded("access:c1:1000", "fp")
+            .mark_authorization_handler_succeeded(&token_for(&state, "access:c1:1000", "fp", 0))
             .unwrap();
         state
-            .commit_authorization("access:c1:1000", "fp", 1_000, "sig", 0, 100, |committed| {
-                Some(serde_json::json!({ "chargedAmount": committed.cumulative.to_string() }))
-            })
+            .commit_authorization(
+                &token_for(&state, "access:c1:1000", "fp", 1_000),
+                "sig",
+                0,
+                100,
+                |committed| {
+                    Some(serde_json::json!({ "chargedAmount": committed.cumulative.to_string() }))
+                },
+            )
             .unwrap();
 
         assert_eq!(state.cumulative, 1_000);
         assert_eq!(state.highest_voucher_signature.as_deref(), Some("sig"));
         assert_eq!(
-            state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 200),
+            state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 200)),
             BatchReservation::Committed,
             "a committed authorization must replay, not reserve"
         );
@@ -2539,7 +3817,13 @@ mod tests {
         assert_eq!(stored["chargedAmount"], serde_json::json!("1000"));
         // Re-committing is a no-op: the watermark cannot advance twice.
         state
-            .commit_authorization("access:c1:1000", "fp", 1_000, "sig", 0, 200, |_| None)
+            .commit_authorization(
+                &token_for(&state, "access:c1:1000", "fp", 1_000),
+                "sig",
+                0,
+                200,
+                |_| None,
+            )
             .unwrap();
         assert_eq!(state.cumulative, 1_000);
     }
@@ -2550,17 +3834,155 @@ mod tests {
     #[test]
     fn a_different_request_cannot_reuse_an_authorization() {
         let mut state = make_state("c1", 10_000);
-        state.reserve_authorization("access:c1:1000", "fp", 1_000, LEASE, 100);
+        state.reserve_authorization(&req("access:c1:1000", "fp", 1_000, 1_000, 100));
         assert_eq!(
-            state.reserve_authorization("access:c1:1000", "other", 1_000, LEASE, 100),
+            state.reserve_authorization(&req("access:c1:1000", "other", 1_000, 1_000, 100)),
             BatchReservation::Conflict
         );
         assert!(state
-            .mark_authorization_handler_succeeded("access:c1:1000", "other")
+            .mark_authorization_handler_succeeded(&token_for(&state, "access:c1:1000", "other", 0))
             .is_err());
         assert!(state
             .release_authorization("access:c1:1000", "other")
             .is_err());
+    }
+
+    /// Two different cumulative vouchers from the same watermark cannot both be
+    /// reserved, and a commit must still step from the watermark its
+    /// reservation priced.
+    #[test]
+    fn one_cumulative_step_is_reserved_at_a_time() {
+        let mut state = make_state("c1", 10_000);
+        assert!(matches!(
+            state.reserve_authorization(&req("access:c1:500", "low", 500, 500, 100)),
+            BatchReservation::Reserved(_)
+        ));
+        assert_eq!(
+            state.reserve_authorization(&req("access:c1:2000", "high", 2_000, 2_000, 100)),
+            BatchReservation::InProgress,
+            "a second step from the same watermark must wait"
+        );
+        state
+            .commit_authorization(
+                &token_for(&state, "access:c1:500", "low", 500),
+                "sig-low",
+                0,
+                100,
+                |_| None,
+            )
+            .unwrap();
+        // The high voucher was priced from the old watermark: it is refused
+        // before serving, not served and then refused at commit.
+        assert_eq!(
+            state.reserve_authorization(&req("access:c1:2000", "high", 2_000, 2_000, 100)),
+            BatchReservation::Stale
+        );
+        assert!(state.pending_deliveries.is_empty());
+        // Commit keeps its own check for a reservation taken before the move.
+        state.pending_deliveries.push(PendingDelivery {
+            delivery_id: "access:c1:2000".to_string(),
+            amount: 2_000,
+            sequence: 99,
+            expires_at: 100 + LEASE.as_secs() as i64,
+            request_fingerprint: Some("high".to_string()),
+            handler_succeeded: false,
+        });
+        assert!(state
+            .commit_authorization(
+                &token_for(&state, "access:c1:2000", "high", 2_000),
+                "sig-high",
+                0,
+                100,
+                |_| { None }
+            )
+            .is_err());
+        assert_eq!(state.cumulative, 500);
+
+        // A dead lease does not block the channel forever.
+        let mut state = make_state("c2", 10_000);
+        state.reserve_authorization(&req("access:c2:500", "a", 500, 500, 100));
+        let after_lease = 100 + LEASE.as_secs() as i64 + 1;
+        assert!(matches!(
+            state.reserve_authorization(&req("access:c2:700", "b", 700, 700, after_lease)),
+            BatchReservation::Reserved(_)
+        ));
+
+        // A voucher that does step from the moved watermark reserves.
+        let mut state = make_state("c3", 10_000);
+        state.reserve_authorization(&req("access:c3:500", "a", 500, 500, 100));
+        state
+            .commit_authorization(
+                &token_for(&state, "access:c3:500", "a", 500),
+                "sig-a",
+                0,
+                100,
+                |_| None,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.reserve_authorization(&req("access:c3:2000", "b", 1_500, 2_000, 100)),
+            BatchReservation::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn a_channel_binding_round_trips_and_refuses_other_deployments() {
+        let mut state = make_state("c1", 10_000);
+        let batch = ChannelBinding {
+            scheme: "batch-settlement".to_string(),
+            pay_to: Some("api-a".to_string()),
+            network: Some("devnet".to_string()),
+            program_id: Some("program-a".to_string()),
+        };
+        assert_eq!(state.binding().unwrap(), None);
+        state
+            .check_binding(&batch)
+            .expect("an unbound legacy record is accepted");
+        state.set_binding(&batch);
+        let decoded: ChannelState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(decoded.binding().unwrap(), Some(batch.clone()));
+        decoded.check_binding(&batch).unwrap();
+        let session = ChannelBinding {
+            scheme: "session".to_string(),
+            ..batch.clone()
+        };
+        assert!(decoded.check_binding(&session).is_err());
+        let other_receiver = ChannelBinding {
+            pay_to: Some("api-b".to_string()),
+            ..batch.clone()
+        };
+        assert!(decoded.check_binding(&other_receiver).is_err());
+        let other_network = ChannelBinding {
+            network: Some("mainnet".to_string()),
+            ..batch.clone()
+        };
+        assert!(decoded.check_binding(&other_network).is_err());
+        let other_program = ChannelBinding {
+            program_id: Some("program-b".to_string()),
+            ..batch.clone()
+        };
+        assert!(decoded.check_binding(&other_program).is_err());
+
+        // An older binding without a receiver is accepted and completed.
+        let mut older = make_state("c2", 10_000);
+        older.set_binding(&ChannelBinding {
+            scheme: "batch-settlement".to_string(),
+            pay_to: None,
+            network: None,
+            program_id: None,
+        });
+        older.check_binding(&batch).unwrap();
+        older.adopt_binding(&batch).unwrap();
+        assert_eq!(older.binding().unwrap(), Some(batch.clone()));
+
+        state
+            .extra
+            .insert(CHANNEL_BINDING_KEY.to_string(), serde_json::json!(7));
+        assert!(
+            state.check_binding(&batch).is_err(),
+            "an unreadable binding fails closed"
+        );
     }
 
     /// Committed records are retained for retries, not forever.
@@ -2570,12 +3992,18 @@ mod tests {
         for step in 1..=(MAX_COMMITTED_AUTHORIZATIONS as u64 + 10) {
             let cumulative = step * 1_000;
             let id = format!("access:c1:{cumulative}");
-            state.reserve_authorization(&id, "fp", 1_000, LEASE, 100);
+            state.reserve_authorization(&req(&id, "fp", 1_000, cumulative, 100));
             state
-                .mark_authorization_handler_succeeded(&id, "fp")
+                .mark_authorization_handler_succeeded(&token_for(&state, &id, "fp", 0))
                 .unwrap();
             state
-                .commit_authorization(&id, "fp", cumulative, "sig", 0, 100, |_| None)
+                .commit_authorization(
+                    &token_for(&state, &id, "fp", cumulative),
+                    "sig",
+                    0,
+                    100,
+                    |_| None,
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -2599,12 +4027,18 @@ mod tests {
         for (step, voucher_expiry) in [(1, 1_000), (2, 500), (3, 1_500)] {
             let cumulative = step * 1_000;
             let id = format!("access:c1:{cumulative}");
-            state.reserve_authorization(&id, "fp", 1_000, LEASE, 100);
+            state.reserve_authorization(&req(&id, "fp", 1_000, cumulative, 100));
             state
-                .mark_authorization_handler_succeeded(&id, "fp")
+                .mark_authorization_handler_succeeded(&token_for(&state, &id, "fp", 0))
                 .unwrap();
             state
-                .commit_authorization(&id, "fp", cumulative, "sig", voucher_expiry, 100, |_| None)
+                .commit_authorization(
+                    &token_for(&state, &id, "fp", cumulative),
+                    "sig",
+                    voucher_expiry,
+                    100,
+                    |_| None,
+                )
                 .unwrap();
         }
 
@@ -2901,6 +4335,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn conformance_state(channel_id: &str) -> ChannelState {
+        make_state(channel_id, 10_000)
+    }
+
+    #[tokio::test]
+    async fn memory_kv_store_passes_conformance() {
+        conformance::check_store(&MemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_store_passes_conformance() {
+        conformance::check_channel_store(&MemoryChannelStore::new(), &conformance_state).await;
+    }
+
+    #[tokio::test]
+    async fn arc_store_passes_conformance() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        conformance::check_channel_store(&store, &conformance_state).await;
+    }
+
+    #[cfg(feature = "redis-store")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redis_store_passes_conformance() {
+        let redis_url = std::env::var("PAY_KIT_TEST_REDIS_URL")
+            .expect("PAY_KIT_TEST_REDIS_URL is required for the Redis integration test");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let store = RedisChannelStore::connect(
+            &redis_url,
+            format!("pay-kit:test:{}:{unique}:", std::process::id()),
+        )
+        .await
+        .unwrap();
+        conformance::check_channel_store(&store, &conformance_state).await;
     }
 
     #[cfg(feature = "redis-store")]

@@ -4,7 +4,10 @@
 //! `../../../docs/snippets-convention.md` for the snippet:start/end convention —
 //! only the marked region is shown; the rest keeps the file compilable.
 
+use std::sync::Arc;
+
 use axum::Router;
+use solana_pay_kit::mpp::store::MemoryStore;
 use solana_pay_kit::{paid_get, PayKit, PayKitConfig, Payment};
 
 // The verified payment lands in the handler.
@@ -17,6 +20,8 @@ async fn main() {
     // snippet:start
     let pay = PayKit::new(PayKitConfig {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+        realm: Some("my-service".to_string()),
+        store: Some(Arc::new(MemoryStore::new())),
         network: "localnet".to_string(),
         rpc_url: Some("https://402.surfnet.dev:8899".to_string()),
         ..Default::default()

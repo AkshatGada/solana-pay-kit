@@ -55,6 +55,9 @@ const CHANNEL_STATUS_OPEN: u8 = 0;
 /// (`crate::generated::payment_channels::generated::instructions::OPEN_DISCRIMINATOR`).
 const OPEN_INSTRUCTION_DISCRIMINATOR: u8 = 1;
 
+/// Shortest lifetime of a settlement voucher this server signs.
+const MIN_SETTLEMENT_VOUCHER_TTL_SECONDS: u64 = 60;
+
 /// Server configuration for the Solana x402 `upto` scheme.
 #[derive(Clone)]
 pub struct UptoConfig {
@@ -379,6 +382,18 @@ impl X402Upto {
         cc: &CurrencyConfig,
         max_amount: &str,
     ) -> Result<UptoRequirements, Error> {
+        self.upto_requirements_for_route(cc, max_amount, None)
+    }
+
+    /// [`Self::upto_requirements_for`] bound to `route`: the requirement
+    /// declares [`Self::route_memo`] as `extra.memo`, which the client signs
+    /// into its channel open, so the authorization only verifies for `route`.
+    pub fn upto_requirements_for_route(
+        &self,
+        cc: &CurrencyConfig,
+        max_amount: &str,
+        route: Option<&str>,
+    ) -> Result<UptoRequirements, Error> {
         let mint = self.mint_for(cc)?;
         let token_program = self.token_program_for(cc)?;
         let base_units = crate::x402::server::exact::parse_units(max_amount, cc.decimals)?;
@@ -399,9 +414,9 @@ impl X402Upto {
                 last_valid_block_height: None,
                 recent_slot: None,
                 valid_after: None,
-                // No seller memo: the server accepts (but never requires) the
+                // Unbound: the server accepts (but never requires) the
                 // client's own memo after `open`.
-                memo: None,
+                memo: route.map(Self::route_memo),
                 transaction_versions: crate::core::tx::advertised(&self.accepted_versions),
             },
         })
@@ -416,6 +431,27 @@ impl X402Upto {
     /// window, and clients MUST take it from the challenge rather than fetch a
     /// slot themselves.
     pub fn upto(&self, max_amount: &str) -> Result<UptoRequiredEnvelope, Error> {
+        self.upto_for_route(max_amount, None)
+    }
+
+    /// The memo a route-bound challenge declares for `route` (a canonical
+    /// request identity such as `"GET /reports?id=7"`).
+    pub fn route_memo(route: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::new()
+            .chain_update(b"x402-upto-route\0")
+            .chain_update(route.as_bytes())
+            .finalize();
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        format!("x402-upto:{hex}")
+    }
+
+    /// [`Self::upto`] bound to `route`; see [`Self::upto_requirements_for_route`].
+    pub fn upto_for_route(
+        &self,
+        max_amount: &str,
+        route: Option<&str>,
+    ) -> Result<UptoRequiredEnvelope, Error> {
         // Fail loudly (retryable) rather than issuing a 402 with no blockhash /
         // recentSlot: the in-SDK client hard-requires both to build the channel
         // open, so a silent `None` would surface as a non-retryable payment
@@ -440,7 +476,7 @@ impl X402Upto {
         let currencies = self.offered_currencies();
         let mut accepts = Vec::with_capacity(currencies.len());
         for cc in currencies {
-            let mut requirement = self.upto_requirements_for(cc, max_amount)?;
+            let mut requirement = self.upto_requirements_for_route(cc, max_amount, route)?;
             requirement.extra.recent_blockhash = Some(hint.blockhash.clone());
             requirement.extra.last_valid_block_height =
                 Some(hint.last_valid_block_height.to_string());
@@ -463,7 +499,16 @@ impl X402Upto {
 
     /// `(header-name, base64-value)` for the `upto` 402 challenge.
     pub fn payment_required_header(&self, max_amount: &str) -> Result<(String, String), Error> {
-        let envelope = self.upto(max_amount)?;
+        self.payment_required_header_for_route(max_amount, None)
+    }
+
+    /// [`Self::payment_required_header`] bound to `route`.
+    pub fn payment_required_header_for_route(
+        &self,
+        max_amount: &str,
+        route: Option<&str>,
+    ) -> Result<(String, String), Error> {
+        let envelope = self.upto_for_route(max_amount, route)?;
         let json = serde_json::to_string(&envelope)
             .map_err(|e| Error::InvalidPaymentRequired(e.to_string()))?;
         Ok((
@@ -512,6 +557,18 @@ impl X402Upto {
         header: &str,
         max_amount: &str,
     ) -> Result<VerifiedUptoOpen, Error> {
+        self.verify_open_for_route(header, max_amount, None).await
+    }
+
+    /// [`Self::verify_open`] for a challenge bound to `route`: the payer's
+    /// signed open must carry that route's memo, so an authorization issued
+    /// for another route does not verify here.
+    pub async fn verify_open_for_route(
+        &self,
+        header: &str,
+        max_amount: &str,
+        route: Option<&str>,
+    ) -> Result<VerifiedUptoOpen, Error> {
         let envelope = self.parse_payment_signature(header)?;
         let payload = &envelope.payload;
 
@@ -524,7 +581,7 @@ impl X402Upto {
         let offered = self
             .offered_currencies()
             .iter()
-            .map(|cc| self.upto_requirements_for(cc, max_amount))
+            .map(|cc| self.upto_requirements_for_route(cc, max_amount, route))
             .collect::<Result<Vec<_>, _>>()?;
         let requirements = match_offered_requirement(&offered, &envelope.accepted)?.clone();
 
@@ -601,14 +658,18 @@ impl X402Upto {
         // drains the operator). Validate before co-signing/broadcasting.
         self.validate_open_transaction(
             &tx,
-            &payer,
-            &expected_payee,
-            &expected_mint,
-            &token_program,
-            &channel_id,
-            max,
-            &payload.nonce,
-            &payload.open_slot,
+            &ExpectedOpen {
+                payer: &payer,
+                payee: &expected_payee,
+                mint: &expected_mint,
+                token_program: &token_program,
+                channel_id: &channel_id,
+                max_amount: max,
+                payload_nonce: &payload.nonce,
+                payload_open_slot: &payload.open_slot,
+                memo: requirements.extra.memo.as_deref(),
+                recipients: &expected_distribution,
+            },
         )?;
         self.cosign_fee_payer(&mut tx).await?;
         crate::core::rpc::send_and_confirm_transaction(&self.rpc, &tx)
@@ -738,12 +799,50 @@ impl X402Upto {
     /// voucher authorization rides inside the `settle_and_seal` instruction
     /// data, not as a transaction signature — so the worker can sign the
     /// envelope on the caller's behalf.
+    ///
+    /// When the payer has closed its token account since the open, the
+    /// `distribute` that refunds it would fail and take the charge down with
+    /// it, so only `settle_and_seal` is emitted: the charge is locked onchain
+    /// and the permissionless `distribute` pays both sides once the payer
+    /// recreates the account to collect its refund. The account is never
+    /// recreated at the fee payer's expense, which the payer could farm.
     pub async fn settlement_instructions(
         &self,
         open: &VerifiedUptoOpen,
         actual: u64,
     ) -> Result<Vec<Instruction>, Error> {
+        let (payer_token, _) =
+            pc::find_associated_token_address(&open.payer, &open.mint, &open.token_program);
+        // Only a confirmed absence drops `distribute`; on an RPC error the
+        // atomic transaction itself is the safeguard.
+        let distribute = !matches!(
+            self.rpc
+                .get_account_with_commitment(&payer_token, self.rpc.commitment())
+                .map(|response| response.value),
+            Ok(None)
+        );
+        if !distribute {
+            tracing::warn!(
+                channel = %open.channel_id,
+                "upto payer token account is gone; sealing the charge without distributing"
+            );
+        }
+        self.build_settlement_instructions(open, actual, distribute)
+            .await
+    }
+
+    async fn build_settlement_instructions(
+        &self,
+        open: &VerifiedUptoOpen,
+        actual: u64,
+        distribute: bool,
+    ) -> Result<Vec<Instruction>, Error> {
         assert_settlement_within_ceiling(actual, open.max_amount)?;
+        // The voucher is signed by this server, so its deadline is chosen here
+        // rather than taken from the client's unsigned `expiresAt`: a deadline
+        // that lapses before the settlement lands would leave the request
+        // served and the charge unredeemable.
+        let expires_at = self.settlement_voucher_expiry();
 
         // `settle_and_seal`'s payee signer is the channel payee — the fee
         // payer. The receiver authorizer signs only the Ed25519 voucher
@@ -755,12 +854,11 @@ impl X402Upto {
                 &self.receiver_authorizer,
                 None,
                 0,
-                open.expires_at,
+                expires_at,
                 &open.program_id,
             )?
         } else {
-            let voucher_bytes =
-                pc::voucher_message_bytes(&open.channel_id, actual, open.expires_at)?;
+            let voucher_bytes = pc::voucher_message_bytes(&open.channel_id, actual, expires_at)?;
             let sig_bytes: [u8; 64] = self
                 .receiver_authorizer_signer()
                 .sign_message(&voucher_bytes)
@@ -773,11 +871,14 @@ impl X402Upto {
                 &self.receiver_authorizer,
                 Some(&sig_bytes),
                 actual,
-                open.expires_at,
+                expires_at,
                 &open.program_id,
             )?
         };
 
+        if !distribute {
+            return Ok(instructions);
+        }
         let payee = open.payee;
         instructions.push(pc::build_create_associated_token_account_instruction(
             &self.fee_payer,
@@ -836,14 +937,9 @@ impl X402Upto {
     /// Settle like [`settle_actual`](Self::settle_actual) but route the
     /// instructions through the shared batched-settlement worker instead of
     /// broadcasting inline: the worker packs concurrent channel settlements into
-    /// one operator-signed transaction, **sends without waiting for
-    /// confirmation**, and confirms/retries in the background. Returns once the
-    /// batch is sent, carrying the (already-final) settle signature for the
-    /// receipt — taking the multi-second confirm poll off the caller's path.
-    ///
-    /// The client's funds are locked by the confirmed channel `open`, so a
-    /// late or failed background confirm is an operator-retry concern (the
-    /// channel store sweeps it), not client-loss.
+    /// one operator-signed transaction. Returns only once that transaction is
+    /// confirmed, so a successful receipt always names a settlement that
+    /// landed; an on-chain failure or an unconfirmed window is an error.
     ///
     /// The worker is spawned lazily on first use and shared across calls (it is
     /// keyed to this handler's operator + RPC), mirroring the mpp session
@@ -878,7 +974,7 @@ impl X402Upto {
             .await;
 
         let signature = handle
-            .settle(open.channel_id.to_string(), instructions)
+            .settle_confirmed(open.channel_id.to_string(), instructions)
             .await
             .map_err(|e| Error::Rpc(format!("upto settlement worker: {e}")))?;
 
@@ -898,15 +994,20 @@ impl X402Upto {
     fn validate_open_transaction(
         &self,
         tx: &VersionedTransaction,
-        payer: &Pubkey,
-        payee: &Pubkey,
-        mint: &Pubkey,
-        token_program: &Pubkey,
-        channel_id: &Pubkey,
-        max_amount: u64,
-        payload_nonce: &str,
-        payload_open_slot: &str,
+        expected: &ExpectedOpen<'_>,
     ) -> Result<(), Error> {
+        let ExpectedOpen {
+            payer,
+            payee,
+            mint,
+            token_program,
+            channel_id,
+            max_amount,
+            payload_nonce,
+            payload_open_slot,
+            memo: expected_memo,
+            recipients: expected_recipients,
+        } = *expected;
         let program_id = self.program_id()?;
         // The challenged recentSlot at verify time: freshly fetched (cache
         // first), so the transaction's openSlot — stamped from the earlier
@@ -941,6 +1042,8 @@ impl X402Upto {
             Some(payload_nonce),
             Some(payload_open_slot),
             challenged_slot,
+            expected_memo,
+            Some(expected_recipients),
         )
     }
 
@@ -966,12 +1069,77 @@ impl X402Upto {
         Ok(())
     }
 
+    /// Deadline for a settlement voucher signed now: the route's completion
+    /// window, with a floor so a zero window still leaves time to land.
+    fn settlement_voucher_expiry(&self) -> i64 {
+        let ttl = self
+            .config
+            .max_timeout_seconds
+            .max(MIN_SETTLEMENT_VOUCHER_TTL_SECONDS);
+        now_unix().saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX))
+    }
+
     fn fetch_channel(&self, channel_id: &Pubkey) -> Result<Channel, Error> {
         let data = self
             .rpc
             .get_account_data(channel_id)
             .map_err(|e| Error::Rpc(format!("channel account fetch failed: {e}")))?;
         Channel::from_bytes(&data).map_err(|e| Error::Other(format!("channel decode failed: {e}")))
+    }
+}
+
+/// The open a client must have built for this challenge; see
+/// [`X402Upto::validate_open_transaction`].
+#[derive(Clone, Copy)]
+struct ExpectedOpen<'a> {
+    payer: &'a Pubkey,
+    payee: &'a Pubkey,
+    mint: &'a Pubkey,
+    token_program: &'a Pubkey,
+    channel_id: &'a Pubkey,
+    max_amount: u64,
+    payload_nonce: &'a str,
+    payload_open_slot: &'a str,
+    memo: Option<&'a str>,
+    recipients: &'a [pc::Distribution],
+}
+
+#[cfg(test)]
+impl X402Upto {
+    /// A verified open for `channel_id` that holds its in-flight slot, without
+    /// the RPC round-trips `verify_open` needs.
+    pub(crate) fn test_open(&self, channel_id: Pubkey, max_amount: u64) -> VerifiedUptoOpen {
+        assert!(self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(channel_id));
+        VerifiedUptoOpen {
+            channel_id,
+            payer: Pubkey::new_unique(),
+            rent_payer: self.fee_payer,
+            mint: Pubkey::new_unique(),
+            token_program: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            program_id: pc::default_program_id(),
+            deposit: max_amount,
+            max_amount,
+            expires_at: now_unix() + 300,
+            network: caip2_network_for_cluster(&self.config.cluster).to_string(),
+            payee: self.fee_payer,
+            distribution: self.distribution().expect("configured distribution"),
+            _in_flight: InFlightGuard {
+                set: self.in_flight.clone(),
+                channel_id,
+            },
+        }
+    }
+
+    #[cfg(all(test, feature = "axum"))]
+    pub(crate) fn is_in_flight(&self, channel_id: &Pubkey) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(channel_id)
     }
 }
 
@@ -1083,13 +1251,14 @@ fn validate_distribution_hash(
 /// the operator would blindly authorize. For the same reason no wrapper
 /// instruction may name the fee payer among its accounts.
 ///
-/// The memo's *contents* are not checked: a facilitator only pins them when the
-/// seller declares `extra.memo`, and this server never does (it advertises
-/// `memo: None`), so any memo the client chooses is acceptable here.
+/// The memo's *contents* are checked only when the challenge was bound to a
+/// route (see [`X402Upto::route_memo`]); unbound challenges advertise
+/// `memo: None`, so any memo the client chose is acceptable there.
 fn find_canonical_open_instruction<'tx>(
     tx: &'tx VersionedTransaction,
     keys: &[Pubkey],
     program_id: &Pubkey,
+    expected_memo: Option<&str>,
 ) -> Result<&'tx CompiledInstruction, Error> {
     Ok(pc::scan_channel_tx_layout(
         tx,
@@ -1097,9 +1266,13 @@ fn find_canonical_open_instruction<'tx>(
         program_id,
         OPEN_INSTRUCTION_DISCRIMINATOR,
         "open",
-        // `upto` servers never declare `extra.memo`, so whatever memo the
-        // client chose is acceptable; only its presence is bounded.
-        pc::MemoPolicy::Optional,
+        // A route-bound challenge declares `extra.memo`, which the payer signs
+        // into the open; otherwise any client memo is acceptable and only its
+        // presence is bounded.
+        match expected_memo {
+            Some(memo) => pc::MemoPolicy::Required(Some(memo)),
+            None => pc::MemoPolicy::Optional,
+        },
     )?)
 }
 
@@ -1125,6 +1298,8 @@ pub(crate) fn validate_open_instruction(
     payload_nonce: Option<&str>,
     payload_open_slot: Option<&str>,
     recent_slot: Option<u64>,
+    expected_memo: Option<&str>,
+    expected_recipients: Option<&[pc::Distribution]>,
 ) -> Result<(), Error> {
     // Reject v0 transactions that pull accounts from address lookup tables.
     // This validator (and the fee-payer co-sign) resolves every account via
@@ -1143,7 +1318,7 @@ pub(crate) fn validate_open_instruction(
     )?;
 
     let keys = tx.message.static_account_keys();
-    let ix = find_canonical_open_instruction(tx, keys, program_id)?;
+    let ix = find_canonical_open_instruction(tx, keys, program_id, expected_memo)?;
     // Account order from `build_open_instruction`:
     // [payer, rentPayer, payee, mint, authorized_signer, channel, ...].
     // rentPayer (slot 1) is whoever funds the channel PDA + escrow-ATA rent and
@@ -1195,18 +1370,34 @@ pub(crate) fn validate_open_instruction(
     )?;
     expect(13, program_id, "self_program")?;
 
-    // openArgs layout:
-    // [discriminator u8][salt u64][deposit u64][grace u32][openSlot u64][recipients].
-    if ix.data.len() < 1 + 8 + 8 + 4 + 8 {
-        return Err(Error::Other(format!(
-            "open instruction data too short ({} bytes)",
-            ix.data.len()
-        )));
+    // [discriminator u8][OpenArgs], decoded whole: trailing or malformed bytes
+    // are refused, and the recipients — not a PDA seed, so free to differ
+    // under the same channel address — are checked before co-signing.
+    let args = ix
+        .data
+        .get(1..)
+        .ok_or_else(|| Error::Other("open instruction data is empty".to_string()))
+        .and_then(|data| {
+            <pc::generated::types::OpenArgs as borsh::BorshDeserialize>::try_from_slice(data)
+                .map_err(|e| Error::Other(format!("open instruction args are malformed: {e}")))
+        })?;
+    let (salt, deposit, grace_period, open_slot) =
+        (args.salt, args.deposit, args.grace_period, args.open_slot);
+    if let Some(expected) = expected_recipients {
+        let recipients: Vec<pc::Distribution> = args
+            .recipients
+            .iter()
+            .map(|entry| pc::Distribution {
+                recipient: pc::from_address(&entry.recipient),
+                bps: entry.bps,
+            })
+            .collect();
+        if recipients != expected {
+            return Err(Error::Other(
+                "open distribution does not match the expected recipient split".to_string(),
+            ));
+        }
     }
-    let salt = u64::from_le_bytes(ix.data[1..9].try_into().expect("8-byte slice"));
-    let deposit = u64::from_le_bytes(ix.data[9..17].try_into().expect("8-byte slice"));
-    let grace_period = u32::from_le_bytes(ix.data[17..21].try_into().expect("4-byte slice"));
-    let open_slot = u64::from_le_bytes(ix.data[21..29].try_into().expect("8-byte slice"));
     if let Some(payload_nonce) = payload_nonce {
         if payload_nonce != salt.to_string() {
             return Err(Error::Other(format!(
@@ -1394,6 +1585,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .is_ok());
     }
@@ -1443,6 +1636,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .is_ok());
 
@@ -1459,6 +1654,8 @@ mod tests {
             &mint,
             &token_program(),
             &channel,
+            None,
+            None,
             None,
             None,
             None,
@@ -1502,6 +1699,8 @@ mod tests {
                 None,
                 None,
                 recent_slot,
+                None,
+                None,
             )
         };
         assert!(check(&channel, Some(1_000_000), Some(314)).is_ok());
@@ -1545,6 +1744,8 @@ mod tests {
                 Some(payload_nonce),
                 Some(payload_open_slot),
                 Some(314),
+                None,
+                None,
             )
         };
         assert!(strict(900, "7", "314").is_ok());
@@ -1582,6 +1783,8 @@ mod tests {
             &mint,
             &token_program(),
             &channel,
+            None,
+            None,
             None,
             None,
             None,
@@ -1626,6 +1829,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .is_err());
 
@@ -1643,6 +1848,8 @@ mod tests {
             &mint,
             &token_program(),
             &channel,
+            None,
+            None,
             None,
             None,
             None,
@@ -1723,6 +1930,8 @@ mod tests {
             &mint,
             &token_program(),
             &channel,
+            None,
+            None,
             None,
             None,
             None,
@@ -1879,6 +2088,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .is_err());
     }
@@ -1908,6 +2119,8 @@ mod tests {
             &mint,
             &wrong_token_program,
             &channel,
+            None,
+            None,
             None,
             None,
             None,
@@ -2061,6 +2274,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2073,6 +2288,214 @@ mod tests {
 
     /// Build an engine offering the given currency symbols (each with 6
     /// decimals and program derived from the symbol).
+    /// The voucher expiry comes from the voucher bytes the precompile verifies.
+    fn settled_voucher_expiry(
+        instructions: &[Instruction],
+        open: &VerifiedUptoOpen,
+        actual: u64,
+    ) -> i64 {
+        let message = pc::voucher_message_bytes(&open.channel_id, actual, 0).unwrap();
+        let prefix = &message[..message.len() - 8];
+        let data = instructions
+            .iter()
+            .find_map(|ix| {
+                ix.data
+                    .windows(prefix.len())
+                    .position(|w| w == prefix)
+                    .map(|at| ix.data[at + prefix.len()..at + prefix.len() + 8].to_vec())
+            })
+            .expect("voucher message present");
+        i64::from_le_bytes(data.try_into().unwrap())
+    }
+
+    /// A client-chosen `expiresAt` that lapses before settlement does not end
+    /// up in the settlement voucher: the server signs its own deadline.
+    #[tokio::test]
+    async fn settlement_voucher_deadline_is_server_derived() {
+        let engine = multi_currency_engine(&["USDC"]);
+        let mut open = engine.test_open(Pubkey::new_unique(), 1_000);
+        let now = now_unix();
+        open.expires_at = now + 1;
+
+        let instructions = engine
+            .build_settlement_instructions(&open, 400, true)
+            .await
+            .unwrap();
+        let expiry = settled_voucher_expiry(&instructions, &open, 400);
+        assert!(
+            expiry >= now + 300,
+            "voucher expiry {expiry} must cover the completion window"
+        );
+
+        open.expires_at = now - 10;
+        let instructions = engine
+            .build_settlement_instructions(&open, 400, true)
+            .await
+            .unwrap();
+        assert!(settled_voucher_expiry(&instructions, &open, 400) > now);
+    }
+
+    /// A route-bound challenge pins the payer-signed open to its route: the
+    /// memo is part of what the payer signs, so an open built from route A's
+    /// challenge does not validate for route B, even with `accepted` rewritten.
+    #[test]
+    fn a_route_bound_open_only_validates_for_its_route() {
+        let (payer, payee, mint, operator) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let params = open_params(payer, payee, mint, operator);
+        let channel = derive_channel_addresses(&params).channel;
+        let memo_a = X402Upto::route_memo("GET /route-a");
+        let memo_b = X402Upto::route_memo("GET /route-b");
+        assert_ne!(memo_a, memo_b);
+        let validate = |instructions: &[Instruction], expected: Option<&str>| {
+            validate_open_instruction(
+                &unsigned_tx(instructions),
+                &[TxVersion::V0],
+                &pc::default_program_id(),
+                &operator,
+                &operator,
+                &payer,
+                &payee,
+                &mint,
+                &token_program(),
+                &channel,
+                None,
+                None,
+                None,
+                None,
+                None,
+                expected,
+                None,
+            )
+        };
+        let open = build_open_instruction(&params);
+        let bound_to_a = [open.clone(), memo_ix(&memo_a)];
+
+        validate(&bound_to_a, Some(&memo_a)).expect("route A accepts its own open");
+        assert!(validate(&bound_to_a, Some(&memo_b)).is_err());
+        assert!(validate(std::slice::from_ref(&open), Some(&memo_b)).is_err());
+        // Unbound verification keeps accepting any client memo.
+        validate(&bound_to_a, None).expect("unbound accepts a client memo");
+    }
+
+    #[test]
+    fn route_bound_requirements_do_not_match_another_route() {
+        let engine = multi_currency_engine(&["USDC"]);
+        let usdc = &engine.config.currencies[0];
+        let a = engine
+            .upto_requirements_for_route(usdc, "0.01", Some("GET /route-a"))
+            .unwrap();
+        let b = engine
+            .upto_requirements_for_route(usdc, "0.01", Some("GET /route-b"))
+            .unwrap();
+        assert_eq!(
+            a.extra.memo.as_deref(),
+            Some(X402Upto::route_memo("GET /route-a").as_str())
+        );
+        let accepted_a = serde_json::to_value(&a).unwrap();
+        assert!(match_offered_requirement(std::slice::from_ref(&b), &accepted_a).is_err());
+        assert!(match_offered_requirement(std::slice::from_ref(&a), &accepted_a).is_ok());
+    }
+
+    /// A payer that closed its token account after the open cannot make the
+    /// settlement fail as a whole: the charge is sealed without the refund.
+    #[tokio::test]
+    async fn settlement_without_a_payer_account_still_seals_the_charge() {
+        let engine = multi_currency_engine(&["USDC"]);
+        let open = engine.test_open(Pubkey::new_unique(), 1_000);
+        let program_id = pc::default_program_id();
+        let is_distribute = |ix: &Instruction| {
+            ix.program_id == program_id && ix.accounts.iter().any(|meta| meta.pubkey == open.payer)
+        };
+
+        let full = engine
+            .build_settlement_instructions(&open, 400, true)
+            .await
+            .unwrap();
+        assert!(full.last().is_some_and(is_distribute));
+
+        let sealed_only = engine
+            .build_settlement_instructions(&open, 400, false)
+            .await
+            .unwrap();
+        assert!(!sealed_only.iter().any(is_distribute));
+        assert!(
+            sealed_only
+                .iter()
+                .all(|ix| ix.program_id != pc::associated_token_program_id()),
+            "no account is created at the fee payer's expense"
+        );
+        assert!(sealed_only.iter().any(|ix| ix.program_id == program_id));
+        assert!(settled_voucher_expiry(&sealed_only, &open, 400) > now_unix());
+    }
+
+    /// A payer-chosen split keeps the channel address (recipients are not a
+    /// PDA seed) but must be refused before the operator co-signs the open.
+    #[test]
+    fn a_payer_selected_distribution_is_refused_before_cosigning() {
+        let (payer, payee, mint, operator) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let beneficiary = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let with_recipients = |recipients: Vec<pc::Distribution>| {
+            let mut params = open_params(payer, payee, mint, operator);
+            params.recipients = recipients;
+            params
+        };
+        let expected = pc::sole_recipient(&beneficiary);
+        let malicious = with_recipients(vec![
+            pc::Distribution {
+                recipient: attacker,
+                bps: 9_999,
+            },
+            pc::Distribution {
+                recipient: beneficiary,
+                bps: 1,
+            },
+        ]);
+        let honest = with_recipients(expected.clone());
+        let channel = derive_channel_addresses(&honest).channel;
+        assert_eq!(derive_channel_addresses(&malicious).channel, channel);
+
+        let validate = |params: &OpenChannelParams, data_suffix: &[u8]| {
+            let mut open = build_open_instruction(params);
+            open.data.extend_from_slice(data_suffix);
+            validate_open_instruction(
+                &unsigned_tx(&[open]),
+                &[TxVersion::V0],
+                &pc::default_program_id(),
+                &operator,
+                &operator,
+                &payer,
+                &payee,
+                &mint,
+                &token_program(),
+                &channel,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&expected),
+            )
+        };
+        assert!(validate(&malicious, &[]).is_err());
+        validate(&honest, &[]).expect("the configured split validates");
+        assert!(
+            validate(&honest, &[0]).is_err(),
+            "trailing bytes after the args are refused"
+        );
+    }
+
     fn multi_currency_engine(symbols: &[&str]) -> X402Upto {
         let currencies = symbols
             .iter()
@@ -2253,6 +2676,8 @@ mod tests {
                 &mint,
                 &token_program(),
                 &channel,
+                None,
+                None,
                 None,
                 None,
                 None,

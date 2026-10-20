@@ -39,6 +39,8 @@ async fn main() {
         .expect("valid operator keypair in MPP_OPERATOR_KEY");
 
     let pay = PayKit::new(PayKitConfig {
+        realm: Some("axum-batch".to_string()),
+        store: Some(Arc::new(solana_pay_kit::mpp::store::MemoryStore::new())),
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
         network: "localnet".to_string(),
         rpc_url: Some("https://402.surfnet.dev:8899".to_string()),

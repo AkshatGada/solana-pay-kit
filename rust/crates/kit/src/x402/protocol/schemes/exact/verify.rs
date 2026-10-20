@@ -15,6 +15,9 @@ use crate::x402::error::Error;
 
 const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5_000_000;
 
+/// Highest compute-unit limit a sponsored fee payer co-signs.
+const MAX_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+
 /// Verify a confirmed transaction matches the expected payment requirements.
 ///
 /// Looks at the on-chain transaction returned for a signature-mode credential
@@ -53,6 +56,29 @@ pub fn verify_transaction_details(
     Ok(())
 }
 
+/// Reject a confirmed payment older than the requirement's advertised
+/// validity window (`maxTimeoutSeconds`). A transaction without a block time
+/// cannot be shown to be fresh.
+pub(crate) fn verify_transaction_age(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    requirements: &PaymentRequirements,
+    now_unix: i64,
+) -> Result<(), Error> {
+    let max_age = requirements
+        .max_age
+        .unwrap_or(super::DEFAULT_MAX_TIMEOUT_SECONDS);
+    let block_time = tx
+        .block_time
+        .ok_or_else(|| Error::Other("invalid_exact_svm_payload_missing_block_time".into()))?;
+    let age = now_unix.saturating_sub(block_time);
+    if age > i64::try_from(max_age).unwrap_or(i64::MAX) {
+        return Err(Error::Other(format!(
+            "invalid_exact_svm_payload_expired: confirmed {age}s ago, accepted for {max_age}s"
+        )));
+    }
+    Ok(())
+}
+
 /// Find a `transferChecked` instruction matching the route's requirements in
 /// the encoded transaction's instruction list.
 ///
@@ -79,6 +105,7 @@ fn verify_on_chain_transfer(
         get_associated_token_address(&expected_recipient, &expected_mint_pubkey, &token_program)
             .to_string();
     let expected_amount_str = expected_amount.to_string();
+    let expected_decimals = expected_decimals(requirements)?;
 
     let ui_tx = match &tx.transaction.transaction {
         EncodedTransaction::Json(ui_tx) => ui_tx,
@@ -92,6 +119,7 @@ fn verify_on_chain_transfer(
                 &expected_destination,
                 &expected_mint,
                 &expected_amount_str,
+                expected_decimals,
             )
         }),
         UiMessage::Raw(message) => message.instructions.iter().any(|instruction| {
@@ -101,6 +129,7 @@ fn verify_on_chain_transfer(
                 &expected_destination,
                 &expected_mint,
                 expected_amount,
+                expected_decimals,
             )
         }),
     };
@@ -117,6 +146,7 @@ fn matches_parsed_transfer(
     expected_destination: &str,
     expected_mint: &str,
     expected_amount: &str,
+    expected_decimals: u8,
 ) -> bool {
     let parsed = match instruction {
         UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed)) => parsed,
@@ -143,13 +173,18 @@ fn matches_parsed_transfer(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let mint = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-    let amount = info
-        .get("tokenAmount")
-        .and_then(|v| v.as_object())
+    let token_amount = info.get("tokenAmount").and_then(|v| v.as_object());
+    let amount = token_amount
         .and_then(|o| o.get("amount"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    destination == expected_destination && mint == expected_mint && amount == expected_amount
+    let decimals = token_amount
+        .and_then(|o| o.get("decimals"))
+        .and_then(|v| v.as_u64());
+    destination == expected_destination
+        && mint == expected_mint
+        && amount == expected_amount
+        && decimals == Some(u64::from(expected_decimals))
 }
 
 fn matches_raw_transfer(
@@ -158,6 +193,7 @@ fn matches_raw_transfer(
     expected_destination: &str,
     expected_mint: &str,
     expected_amount: u64,
+    expected_decimals: u8,
 ) -> bool {
     let program = match account_keys.get(instruction.program_id_index as usize) {
         Some(s) => s.as_str(),
@@ -178,7 +214,7 @@ fn matches_raw_transfer(
         Ok(b) => b,
         Err(_) => return false,
     };
-    if u64::from_le_bytes(amount_bytes) != expected_amount {
+    if u64::from_le_bytes(amount_bytes) != expected_amount || bytes[9] != expected_decimals {
         return false;
     }
     if instruction.accounts.len() < 4 {
@@ -218,9 +254,19 @@ pub fn verify_exact_versioned_transaction(
     // has no ComputeBudget prefix; the price cap is applied to the header.
     let budgeted = version == crate::core::tx::TxVersion::V1;
     if budgeted {
+        let declared = crate::core::tx::DeclaredBudget::of(&tx.message)
+            .map_err(|e| Error::Other(format!("invalid_exact_svm_payload_transaction: {e}")))?;
+        if declared
+            .unit_limit
+            .is_some_and(|limit| limit > MAX_COMPUTE_UNIT_LIMIT)
+        {
+            return invalid(
+                "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction_too_high",
+            );
+        }
         crate::core::tx::check_v1_budget_caps(
             &tx.message,
-            u32::MAX,
+            MAX_COMPUTE_UNIT_LIMIT,
             MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS,
         )
         .map_err(|_| {
@@ -236,7 +282,38 @@ pub fn verify_exact_versioned_transaction(
         requirements,
         managed_signers,
         budgeted,
-    )
+    )?;
+    verify_required_signers(&tx.message, budgeted)
+}
+
+/// Only the fee payer and the transfer authority may sign: every extra
+/// required signature is a base fee the sponsor pays.
+fn verify_required_signers(
+    message: &solana_message::VersionedMessage,
+    header_budget: bool,
+) -> Result<(), Error> {
+    let keys = message.static_account_keys();
+    let prefix = if header_budget { 0 } else { 2 };
+    let authority = message
+        .instructions()
+        .get(prefix)
+        .and_then(|transfer| transfer.accounts.get(3))
+        .and_then(|index| keys.get(*index as usize))
+        .ok_or_else(|| Error::Other("invalid_exact_svm_payload_no_transfer_instruction".into()))?;
+    let fee_payer = keys
+        .first()
+        .ok_or_else(|| Error::Other("invalid_exact_svm_payload_transaction".into()))?;
+    let required = message.header().num_required_signatures as usize;
+    let signers = keys
+        .get(..required)
+        .ok_or_else(|| Error::Other("invalid_exact_svm_payload_transaction".into()))?;
+    if signers
+        .iter()
+        .any(|signer| signer != fee_payer && signer != authority)
+    {
+        return invalid("invalid_exact_svm_payload_transaction_unexpected_signer");
+    }
+    Ok(())
 }
 
 fn verify_exact_instructions(
@@ -349,6 +426,16 @@ fn verify_compute_limit_instruction(
             "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction",
         );
     }
+    let units = u32::from_le_bytes(instruction.data[1..5].try_into().map_err(|_| {
+        Error::Other(
+            "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction".into(),
+        )
+    })?);
+    if units > MAX_COMPUTE_UNIT_LIMIT {
+        return invalid(
+            "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction_too_high",
+        );
+    }
     Ok(())
 }
 
@@ -433,8 +520,20 @@ fn verify_transfer_instruction(
     if amount != expected_amount {
         return invalid("invalid_exact_svm_payload_amount_mismatch");
     }
+    // `transferChecked` fails unless this equals the mint's decimals, so it
+    // proves the advertised precision.
+    if instruction.data[9] != expected_decimals(requirements)? {
+        return invalid("invalid_exact_svm_payload_decimals_mismatch");
+    }
 
     Ok(())
+}
+
+/// The precision the route priced the transfer at; SPL payments require it.
+fn expected_decimals(requirements: &PaymentRequirements) -> Result<u8, Error> {
+    requirements
+        .decimals
+        .ok_or_else(|| Error::Other("invalid_exact_svm_payload_decimals_missing".into()))
 }
 
 fn key_for_account_index(index: u8, account_keys: &[Pubkey]) -> Result<&Pubkey, Error> {
@@ -1328,5 +1427,219 @@ mod tests {
         assert!(
             matches!(err, Error::Other(reason) if reason == "invalid_exact_svm_payload_unknown_fourth_instruction")
         );
+    }
+
+    #[test]
+    fn verify_exact_transaction_caps_v0_compute_unit_limit() {
+        let requirements = requirements("1000");
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let with_limit = |units: u32| {
+            let mut tx = build_exact_transaction(
+                &requirements,
+                &fee_payer,
+                &owner,
+                vec![],
+                1000,
+                None,
+                None,
+            );
+            ix_mut(&mut tx, 0).data = [vec![2], units.to_le_bytes().to_vec()].concat();
+            tx
+        };
+
+        assert!(verify_exact_transaction(
+            &with_limit(MAX_COMPUTE_UNIT_LIMIT),
+            &requirements,
+            &[fee_payer]
+        )
+        .is_ok());
+        for units in [MAX_COMPUTE_UNIT_LIMIT + 1, 1_400_000, u32::MAX] {
+            let err = verify_exact_transaction(&with_limit(units), &requirements, &[fee_payer])
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Other(ref reason) if reason == "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction_too_high"),
+                "{units}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_exact_transaction_caps_v1_compute_unit_limit() {
+        let requirements = requirements("1000");
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let with_limit = |units: u32| {
+            build_exact_v1_transaction(
+                &requirements,
+                &fee_payer,
+                &owner,
+                vec![],
+                crate::core::tx::ComputeBudget::new(units, 1),
+            )
+        };
+
+        assert!(verify_exact_versioned_transaction(
+            &with_limit(MAX_COMPUTE_UNIT_LIMIT),
+            &requirements,
+            &[fee_payer]
+        )
+        .is_ok());
+        for units in [MAX_COMPUTE_UNIT_LIMIT + 1, u32::MAX] {
+            let err =
+                verify_exact_versioned_transaction(&with_limit(units), &requirements, &[fee_payer])
+                    .unwrap_err();
+            assert!(err.to_string().contains("compute_limit"), "{units}: {err}");
+        }
+    }
+
+    fn memo_with_signers(signers: &[Pubkey]) -> Instruction {
+        Instruction {
+            program_id: Pubkey::from_str(programs::MEMO_PROGRAM).unwrap(),
+            accounts: signers
+                .iter()
+                .map(|signer| AccountMeta::new_readonly(*signer, true))
+                .collect(),
+            data: b"deadbeef".to_vec(),
+        }
+    }
+
+    #[test]
+    fn verify_exact_transaction_rejects_extra_required_signers() {
+        let requirements = requirements("1000");
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let extra = [Pubkey::new_unique(), Pubkey::new_unique()];
+
+        for memo in [memo_with_signers(&extra[..1]), memo_with_signers(&extra)] {
+            for tx in [
+                build_exact_transaction(
+                    &requirements,
+                    &fee_payer,
+                    &owner,
+                    vec![memo.clone()],
+                    1000,
+                    None,
+                    None,
+                ),
+                build_exact_v1_transaction(
+                    &requirements,
+                    &fee_payer,
+                    &owner,
+                    vec![memo.clone()],
+                    crate::core::tx::ComputeBudget::new(20_000, 1),
+                ),
+            ] {
+                assert!(tx.message.header().num_required_signatures > 2);
+                let err = verify_exact_versioned_transaction(&tx, &requirements, &[fee_payer])
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::Other(ref reason) if reason == "invalid_exact_svm_payload_transaction_unexpected_signer"),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_exact_transaction_accepts_fee_payer_and_authority_signers() {
+        let requirements = requirements("1000");
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        // A memo signed by an existing signer adds no signature.
+        let tx = build_exact_transaction(
+            &requirements,
+            &fee_payer,
+            &owner,
+            vec![memo_with_signers(&[owner, fee_payer])],
+            1000,
+            None,
+            None,
+        );
+        assert_eq!(tx.message.header().num_required_signatures, 2);
+        assert!(verify_exact_versioned_transaction(&tx, &requirements, &[fee_payer]).is_ok());
+
+        // Unsponsored: the authority pays its own fee.
+        let tx = build_exact_transaction(&requirements, &owner, &owner, vec![], 1000, None, None);
+        assert_eq!(tx.message.header().num_required_signatures, 1);
+        assert!(verify_exact_versioned_transaction(&tx, &requirements, &[]).is_ok());
+    }
+
+    /// A confirmed raw (non-parsed) `transferChecked` carrying `decimals`.
+    fn tx_with_raw_transfer(
+        requirements: &PaymentRequirements,
+        decimals: u8,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let owner = Pubkey::new_unique();
+        let mut with_decimals = requirements.clone();
+        with_decimals.decimals = Some(decimals);
+        let ix = transfer_checked_ix(&owner, &with_decimals, 1000, None, None);
+        let mut keys: Vec<String> = ix.accounts.iter().map(|a| a.pubkey.to_string()).collect();
+        keys.push(ix.program_id.to_string());
+        let mut tx = tx_with_meta(None);
+        tx.transaction.transaction = EncodedTransaction::Json(UiTransaction {
+            signatures: vec!["sig".to_string()],
+            message: UiMessage::Raw(UiRawMessage {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: keys,
+                recent_blockhash: "blockhash".to_string(),
+                instructions: vec![
+                    solana_transaction_status_client_types::UiCompiledInstruction {
+                        program_id_index: 4,
+                        accounts: vec![0, 1, 2, 3],
+                        data: bs58::encode(&ix.data).into_string(),
+                        stack_height: None,
+                    },
+                ],
+                address_table_lookups: None,
+                transaction_config: None,
+            }),
+        });
+        tx
+    }
+
+    #[test]
+    fn verify_transaction_details_binds_transfer_decimals() {
+        let route = requirements("1000");
+
+        // Same raw amount at a different precision moves a different value.
+        let mut nine = route.clone();
+        nine.decimals = Some(9);
+        let parsed = tx_with_parsed_transfer_and_memos(&nine, &[]);
+        assert!(verify_transaction_details(&parsed, &route).is_err());
+        assert!(verify_transaction_details(&tx_with_raw_transfer(&route, 9), &route).is_err());
+        assert!(verify_transaction_details(&tx_with_raw_transfer(&route, 5), &route).is_err());
+
+        let parsed = tx_with_parsed_transfer_and_memos(&route, &[]);
+        assert!(verify_transaction_details(&parsed, &route).is_ok());
+        assert!(verify_transaction_details(&tx_with_raw_transfer(&route, 6), &route).is_ok());
+
+        let mut unpriced = route.clone();
+        unpriced.decimals = None;
+        let err = verify_transaction_details(&parsed, &unpriced).unwrap_err();
+        assert!(err.to_string().contains("decimals_missing"), "{err}");
+    }
+
+    #[test]
+    fn verify_exact_transaction_binds_transfer_decimals() {
+        let route = requirements("1000");
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        for decimals in [0u8, 5, 9] {
+            let mut built = route.clone();
+            built.decimals = Some(decimals);
+            let tx = build_exact_transaction(&built, &fee_payer, &owner, vec![], 1000, None, None);
+            let err = verify_exact_transaction(&tx, &route, &[fee_payer]).unwrap_err();
+            assert!(
+                matches!(err, Error::Other(ref reason) if reason == "invalid_exact_svm_payload_decimals_mismatch"),
+                "{decimals}: {err:?}"
+            );
+        }
+        let tx = build_exact_transaction(&route, &fee_payer, &owner, vec![], 1000, None, None);
+        assert!(verify_exact_transaction(&tx, &route, &[fee_payer]).is_ok());
     }
 }

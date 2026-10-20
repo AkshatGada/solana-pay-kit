@@ -77,6 +77,10 @@ pub struct BuildChargeTransactionOptions {
     /// auto-pay agent meant for one network from being lured into
     /// signing a transaction for another.
     pub expected_network: Option<String>,
+    /// Opt-in: let the signer fund rent for split ATAs the challenge asks it
+    /// to create (`ataCreationRequired` without a server fee payer). That rent
+    /// is spent on top of the charged amount, so it is refused by default.
+    pub allow_payer_funded_ata_creation: bool,
     /// Bounded compute-unit price/limit for the prepared
     /// transaction. Defaults match the historical hardcoded budget (1
     /// micro-lamport, 200,000 CU) — existing callers see no behavior change
@@ -290,6 +294,7 @@ pub async fn build_prepared_charge(
             "channelCharge requires the explicit build_channel_charge_credential API".into(),
         ));
     }
+    require_supported_network(method_details)?;
     let splits = method_details.splits.as_deref().unwrap_or(&[]);
     if splits.len() > crate::mpp::protocol::solana::MAX_SPLITS {
         return Err(Error::TooManySplits);
@@ -341,6 +346,13 @@ pub async fn build_prepared_charge(
         if mint_str != currency {
             return Err(Error::Other(
                 "ataCreationRequired requires currency to be an SPL token mint address".into(),
+            ));
+        }
+        if fee_payer_pubkey.is_none() && !options.allow_payer_funded_ata_creation {
+            return Err(Error::Other(
+                "ataCreationRequired without a server fee payer would spend the signer's SOL on \
+                 rent beyond the charged amount; set allow_payer_funded_ata_creation to accept"
+                    .into(),
             ));
         }
     }
@@ -410,6 +422,7 @@ pub async fn build_charge_transaction_with_options(
             "channelCharge requires the explicit build_channel_charge_credential API".into(),
         ));
     }
+    require_supported_network(method_details)?;
     let total_amount: u64 = amount
         .parse()
         .map_err(|_| Error::Other(format!("Invalid amount: {amount}")))?;
@@ -638,7 +651,9 @@ pub fn select_charge_challenge<'a>(
 
         let (request, method_details) = decode_charge_challenge(challenge)?;
 
-        if !matches_network(&method_details, options.network) {
+        if require_supported_network(&method_details).is_err()
+            || !matches_network(&method_details, options.network)
+        {
             continue;
         }
 
@@ -979,6 +994,19 @@ fn decode_charge_challenge(
     let method_details = serde_json::from_value(method_details)
         .map_err(|e| Error::Other(format!("Invalid method details: {e}")))?;
     Ok((request, method_details))
+}
+
+/// Refuse a challenge on a network the client cannot identify, so it never
+/// resolves to a mainnet mint by default.
+fn require_supported_network(method_details: &MethodDetails) -> Result<(), Error> {
+    crate::mpp::protocol::solana::canonical_network(method_details.network.as_deref())
+        .map(|_| ())
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "Unsupported challenge network `{}` (allowed: `mainnet`, `devnet`, `localnet`)",
+                method_details.network.as_deref().unwrap_or_default()
+            ))
+        })
 }
 
 fn matches_network(method_details: &MethodDetails, network: Option<&str>) -> bool {
@@ -2488,7 +2516,10 @@ mod tests {
             USDC_MINT,
             RECIPIENT,
             &md,
-            &BuildChargeTransactionOptions::default(),
+            &BuildChargeTransactionOptions {
+                allow_payer_funded_ata_creation: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap_err();
@@ -2734,8 +2765,7 @@ mod tests {
             None,
             false,
         )
-        .err()
-        .expect("missing decimals should be rejected");
+        .expect_err("missing decimals should be rejected");
         assert!(
             format!("{err}").contains("decimals is required"),
             "got: {err}"
@@ -3304,8 +3334,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("amount above cap should be rejected");
+        .expect_err("amount above cap should be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("exceeds client max_amount_base_units"),
@@ -3359,8 +3388,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("network mismatch should be rejected");
+        .expect_err("network mismatch should be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("does not match client expected_network"),
@@ -3456,8 +3484,7 @@ mod tests {
 
         let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
             .await
-            .err()
-            .expect("expired challenge should be rejected");
+            .expect_err("expired challenge should be rejected");
         assert!(
             format!("{err}").contains("expired"),
             "unexpected error: {err}"
@@ -3523,8 +3550,7 @@ mod tests {
 
         let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
             .await
-            .err()
-            .expect("non-solana method should be rejected");
+            .expect_err("non-solana method should be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("not a solana/charge challenge") && msg.contains("method=`stripe`"),
@@ -3559,8 +3585,7 @@ mod tests {
 
         let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
             .await
-            .err()
-            .expect("non-charge intent should be rejected");
+            .expect_err("non-charge intent should be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("not a solana/charge challenge") && msg.contains("intent=`session`"),
@@ -3590,5 +3615,142 @@ mod tests {
         let err = build_credential_header(signer.as_ref(), &rpc, &challenge).await;
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("Invalid method details"));
+    }
+
+    #[test]
+    fn select_charge_challenge_skips_unsupported_networks_without_a_preference() {
+        for network in ["attacker-chain", "testnet", "Mainnet", ""] {
+            let challenges = vec![selection_challenge("bad", "solana", "USDC", network)];
+            assert!(
+                select_charge_challenge(&challenges, SelectChargeChallengeOptions::default())
+                    .unwrap()
+                    .is_none(),
+                "{network:?}"
+            );
+        }
+
+        let challenges = vec![
+            selection_challenge("bad", "solana", "USDC", "attacker-chain"),
+            selection_challenge("good", "solana", "USDC", "mainnet"),
+        ];
+        let selected =
+            select_charge_challenge(&challenges, SelectChargeChallengeOptions::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.id, "good");
+    }
+
+    #[tokio::test]
+    async fn build_charge_refuses_an_unsupported_network() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        for network in ["attacker-chain", "testnet", "solana:mainnet"] {
+            let md = MethodDetails {
+                recent_blockhash: Some(ZERO_HASH.to_string()),
+                network: Some(network.to_string()),
+                ..Default::default()
+            };
+            let err =
+                build_charge_transaction(signer.as_ref(), &rpc, "1000", "USDC", RECIPIENT, &md)
+                    .await
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("Unsupported challenge network"),
+                "{network}: {err}"
+            );
+            assert!(build_prepared_charge(
+                signer.pubkey(),
+                &rpc,
+                1000,
+                "USDC",
+                RECIPIENT,
+                &md,
+                &BuildChargeTransactionOptions::default(),
+            )
+            .await
+            .is_err());
+        }
+
+        for network in [None, Some("mainnet"), Some("devnet")] {
+            let md = MethodDetails {
+                recent_blockhash: Some(ZERO_HASH.to_string()),
+                network: network.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(
+                build_charge_transaction(signer.as_ref(), &rpc, "1000", "SOL", RECIPIENT, &md)
+                    .await
+                    .is_ok(),
+                "{network:?}"
+            );
+        }
+    }
+
+    fn ata_split_details(fee_payer: Option<Pubkey>) -> MethodDetails {
+        MethodDetails {
+            recent_blockhash: Some(ZERO_HASH.to_string()),
+            token_program: Some(programs::TOKEN_PROGRAM.to_string()),
+            decimals: Some(6),
+            fee_payer: fee_payer.map(|_| true),
+            fee_payer_key: fee_payer.map(|key| key.to_string()),
+            splits: Some(
+                (0..8)
+                    .map(|_| Split {
+                        recipient: Pubkey::new_unique().to_string(),
+                        amount: "1".to_string(),
+                        ata_creation_required: Some(true),
+                        label: None,
+                        memo: None,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn build_charge_refuses_payer_funded_split_ata_rent_by_default() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let md = ata_split_details(None);
+
+        let err =
+            build_charge_transaction(signer.as_ref(), &rpc, "1000000", USDC_MINT, RECIPIENT, &md)
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("allow_payer_funded_ata_creation"),
+            "{err}"
+        );
+
+        // Explicit opt-in still builds the signer-funded creations.
+        let payload = build_charge_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            "1000000",
+            USDC_MINT,
+            RECIPIENT,
+            &md,
+            BuildChargeTransactionOptions {
+                allow_payer_funded_ata_creation: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(payload, CredentialPayload::Transaction { .. }));
+
+        // A server fee payer funds the rent, so no opt-in is needed.
+        let md = ata_split_details(Some(Pubkey::new_unique()));
+        assert!(build_charge_transaction(
+            signer.as_ref(),
+            &rpc,
+            "1000000",
+            USDC_MINT,
+            RECIPIENT,
+            &md
+        )
+        .await
+        .is_ok());
     }
 }

@@ -35,9 +35,15 @@ import {
     type TransactionPartialSigner,
     type TransactionSigner,
 } from '@solana/kit';
-import { findAssociatedTokenPda } from '@solana-program/token';
+import { findAssociatedTokenPda, getCreateAssociatedTokenIdempotentInstruction } from '@solana-program/token';
 
-import { ASSOCIATED_TOKEN_PROGRAM, defaultTokenProgramForCurrency, resolveStablecoinMint } from '../../constants.js';
+import {
+    ASSOCIATED_TOKEN_PROGRAM,
+    defaultTokenProgramForCurrency,
+    normalizeNetwork,
+    resolveStablecoinMint,
+    validateNetwork,
+} from '../../constants.js';
 import { fetchChannel } from '../../generated/payment-channels/accounts/channel.js';
 import { getDistributeInstruction } from '../../generated/payment-channels/instructions/distribute.js';
 import { getOpenInstructionDataDecoder } from '../../generated/payment-channels/instructions/open.js';
@@ -88,15 +94,49 @@ export const PAYMENT_CHANNELS_PROGRAM_ID = PAYMENT_CHANNELS_PROGRAM_ADDRESS;
 export const OPEN_SLOT_WINDOW = 1_500n;
 
 /**
- * Treasury owner baked into the deployed (mainnet-build) payment-channels
- * program — Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP. The treasury ATA is
+ * Treasury owner baked into the mainnet-build payment-channels program —
+ * Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP. The treasury ATA is
  * ATA(TREASURY_OWNER, mint, tokenProgram). Mirrors `TREASURY_OWNER` in
- * `rust/crates/core/src/payment_channels.rs`.
+ * `rust/crates/kit/src/core/payment_channel/v1.rs`.
  */
 const TREASURY_OWNER_BYTES = new Uint8Array([
     0xb0, 0x41, 0xd9, 0xd3, 0x37, 0xb7, 0x21, 0xbe, 0x57, 0x89, 0x4e, 0xb6, 0x9c, 0x3b, 0x68, 0x09, 0xa5, 0x3a, 0x0e,
     0x2b, 0x6a, 0x23, 0x99, 0xfc, 0x7d, 0x5b, 0x7e, 0xda, 0x8c, 0xac, 0x89, 0xaa,
 ]);
+
+/**
+ * Treasury owner baked into the devnet-build payment-channels program —
+ * 4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap. Mirrors
+ * `DEVNET_TREASURY_OWNER` in `rust/crates/kit/src/core/payment_channel/v1.rs`.
+ */
+const DEVNET_TREASURY_OWNER_BYTES = new Uint8Array([
+    0x3b, 0x4b, 0x4a, 0x4c, 0x3e, 0xcd, 0x7e, 0x59, 0xd6, 0x34, 0xae, 0x67, 0xe5, 0xde, 0xbb, 0xec, 0x0a, 0xd0, 0x6f,
+    0x20, 0x4d, 0xf0, 0x13, 0xa6, 0x95, 0xa3, 0x37, 0x6a, 0x57, 0xb9, 0x8d, 0x05,
+]);
+
+/**
+ * Treasury owner the payment-channels deployment on `network` was built
+ * with. Localnet runs the mainnet build. Throws on unsupported networks.
+ */
+export function treasuryOwnerForNetwork(network: string): Address {
+    validateNetwork(network);
+    const bytes = normalizeNetwork(network) === 'devnet' ? DEVNET_TREASURY_OWNER_BYTES : TREASURY_OWNER_BYTES;
+    return getBase58FromBytes(bytes);
+}
+
+const COMPUTE_BUDGET_PROGRAM_ADDRESS = 'ComputeBudget111111111111111111111111111111';
+
+/**
+ * Compute Budget ceilings for client-built channel transactions the server
+ * broadcasts. The general caps mirror `OPEN_MAX_COMPUTE_UNIT_LIMIT` /
+ * `MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS` in
+ * `rust/crates/kit/src/core/payment_channel/v1.rs`; the tighter sponsored caps
+ * apply when the operator, not the channel payer, pays the fee.
+ */
+const MAX_COMPUTE_UNIT_LIMIT = 400_000;
+const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS = 5_000_000n;
+const MAX_SPONSORED_COMPUTE_UNIT_LIMIT = 200_000;
+const MAX_SPONSORED_COMPUTE_UNIT_PRICE_MICROLAMPORTS = 10_000n;
 
 /** Payment-channel open instruction discriminator. */
 const OPEN_DISCRIMINATOR = 1;
@@ -281,6 +321,8 @@ export function buildSettleAndSealInstructions(args: SettleAndSealBuildArgs): Se
 export interface DistributeBuildArgs {
     readonly channelState: { readonly channelId: string; readonly payee: string; readonly payer: string };
     readonly mint: string;
+    /** Cluster the channel lives on; selects the deployment's treasury owner. */
+    readonly network: string;
     readonly payerAddr?: string | undefined;
     readonly programId?: Address | undefined;
     /**
@@ -323,7 +365,7 @@ export async function buildDistributeInstruction(args: DistributeBuildArgs): Pro
     const [payerTokenAccount] = await findAssociatedTokenPda({ mint, owner: payer, tokenProgram });
     const [payeeTokenAccount] = await findAssociatedTokenPda({ mint, owner: payee, tokenProgram });
     const [eventAuthority] = await findEventAuthorityPda({ programAddress: programId });
-    const treasury = deriveTreasuryAddress();
+    const treasury = treasuryOwnerForNetwork(args.network);
     const [treasuryTokenAccount] = await findAssociatedTokenPda({ mint, owner: treasury, tokenProgram });
 
     const recipientTokenAccounts: Address[] = [];
@@ -481,6 +523,7 @@ export interface VerifyOpenTxExpected {
 export interface SignatureStatus {
     readonly confirmationStatus?: string | null | undefined;
     readonly err: unknown;
+    readonly slot?: bigint | undefined;
 }
 
 /** Minimal RPC shape needed to check transaction signature statuses. */
@@ -586,12 +629,14 @@ export async function verifyOpenTx(args: VerifyOpenTxArgs): Promise<VerifyOpenTx
     }
 
     let openIx: { accountIndices: readonly number[]; data: Uint8Array } | undefined;
+    const computeBudgetIxs: CompiledComputeBudgetInstruction[] = [];
     for (const ix of message.instructions) {
         const programIxAddr = message.staticAccounts[ix.programAddressIndex];
         if (programIxAddr !== programIdStr) {
-            if (programIxAddr !== 'ComputeBudget111111111111111111111111111111') {
+            if (programIxAddr !== COMPUTE_BUDGET_PROGRAM_ADDRESS) {
                 throw new Error(`verifyOpenTx: unexpected instruction program ${String(programIxAddr)}`);
             }
+            computeBudgetIxs.push(ix);
             continue;
         }
         // Some decoders omit `data` entirely for empty instruction data.
@@ -633,6 +678,10 @@ export async function verifyOpenTx(args: VerifyOpenTxArgs): Promise<VerifyOpenTx
             `verifyOpenTx: transaction fee payer ${String(message.staticAccounts[0])} != expected ${expected.feePayer}`,
         );
     }
+    validateComputeBudgetInstructions(computeBudgetIxs, {
+        label: 'verifyOpenTx',
+        sponsored: expected.feePayer !== payerAddr,
+    });
     const signatures = decoded.signatures as Readonly<Record<string, Uint8Array | null>>;
     const payerSignature = signatures[payerAddr];
     if (!payerSignature || payerSignature.every(byte => byte === 0)) {
@@ -765,9 +814,13 @@ export async function submitTopUpTx(args: {
     };
     if (message.addressTableLookups?.length) throw new Error('submitTopUpTx: address lookup tables are not permitted');
     let found = false;
+    const computeBudgetIxs: CompiledComputeBudgetInstruction[] = [];
     for (const ix of message.instructions) {
         const program = message.staticAccounts[ix.programAddressIndex];
-        if (program === 'ComputeBudget111111111111111111111111111111') continue;
+        if (program === COMPUTE_BUDGET_PROGRAM_ADDRESS) {
+            computeBudgetIxs.push(ix);
+            continue;
+        }
         if (program !== args.channelProgram || !ix.data || found) {
             throw new Error(`submitTopUpTx: unexpected instruction program ${String(program)}`);
         }
@@ -784,6 +837,10 @@ export async function submitTopUpTx(args: {
         found = true;
     }
     if (!found) throw new Error('submitTopUpTx: top-up instruction not found');
+    validateComputeBudgetInstructions(computeBudgetIxs, {
+        label: 'submitTopUpTx',
+        sponsored: message.staticAccounts[0] !== args.payer,
+    });
     let signature: Signature;
     try {
         signature = await args.rpc
@@ -801,16 +858,23 @@ export async function submitTopUpTx(args: {
         if (!status || status.err) throw error;
         signature = landed;
     }
-    await waitForSignatureConfirmation({ context: 'submitTopUpTx', rpc: args.rpc, signature });
-    // Post-confirm re-check, mirroring Rust: the confirmed channel account
-    // must be open and reflect at least the recorded deposit plus this
-    // top-up before the deposit cap is raised.
-    const account = await fetchChannel(args.rpc as never, address(args.channelId), { commitment: 'confirmed' });
+    // A confirmed top-up can still be forked out: credit only a finalized
+    // signature, against finalized channel state from that slot.
+    const { slot } = await waitForSignatureConfirmation({
+        context: 'submitTopUpTx',
+        options: { commitment: 'finalized' },
+        rpc: args.rpc,
+        signature,
+    });
+    const account = await fetchChannel(args.rpc as never, address(args.channelId), {
+        commitment: 'finalized',
+        ...(slot === undefined ? {} : { minContextSlot: slot }),
+    });
     if (
         account.data.status !== Number(ChannelStatus.Open) ||
         account.data.deposit < args.currentDeposit + args.additionalAmount
     ) {
-        throw new Error('submitTopUpTx: confirmed channel state does not reflect the submitted top-up');
+        throw new Error('submitTopUpTx: finalized channel state does not reflect the submitted top-up');
     }
     return signature;
 }
@@ -822,11 +886,13 @@ export function transactionSignatureFromWire(transaction: string): Signature {
 
 /** Tuning knobs for {@link waitForSignatureConfirmation}. */
 export interface ConfirmSignatureOptions {
+    /** Commitment the signature must reach. Defaults to `'confirmed'`. */
+    readonly commitment?: 'confirmed' | 'finalized' | undefined;
     /** Delay between status polls in ms. Defaults to 1_000. */
     readonly pollIntervalMs?: number | undefined;
     /** Optional abort signal to cancel the wait early. */
     readonly signal?: AbortSignal | undefined;
-    /** Total time budget in ms. Defaults to 30_000. */
+    /** Total time budget in ms. Defaults to 30_000, or 60_000 when finalized. */
     readonly timeoutMs?: number | undefined;
 }
 
@@ -840,9 +906,10 @@ export async function waitForSignatureConfirmation(args: {
     readonly options?: ConfirmSignatureOptions | undefined;
     readonly rpc: SignatureStatusRpc;
     readonly signature: Signature;
-}): Promise<void> {
+}): Promise<{ readonly slot: bigint | undefined }> {
     const context = args.context ?? 'waitForSignatureConfirmation';
-    const timeoutMs = args.options?.timeoutMs ?? 30_000;
+    const finalized = args.options?.commitment === 'finalized';
+    const timeoutMs = args.options?.timeoutMs ?? (finalized ? 60_000 : 30_000);
     const pollIntervalMs = args.options?.pollIntervalMs ?? 1_000;
     const deadline = Date.now() + timeoutMs;
 
@@ -856,14 +923,19 @@ export async function waitForSignatureConfirmation(args: {
                 throw new Error(`${context}: tx ${args.signature} failed on-chain: ${JSON.stringify(status.err)}`);
             }
             const level = status.confirmationStatus;
-            // RPC endpoints that omit confirmationStatus only report a
-            // status once the tx landed — treat that as confirmed.
-            if (level === undefined || level === null || level === 'confirmed' || level === 'finalized') {
-                return;
+            const slot = status.slot;
+            if (finalized) {
+                if (level === 'finalized') return { slot };
+            } else if (level === undefined || level === null || level === 'confirmed' || level === 'finalized') {
+                // RPC endpoints that omit confirmationStatus only report a
+                // status once the tx landed — treat that as confirmed.
+                return { slot };
             }
         }
         if (Date.now() >= deadline) {
-            throw new Error(`${context}: timed out waiting for tx ${args.signature} confirmation`);
+            throw new Error(
+                `${context}: timed out waiting for tx ${args.signature} ${finalized ? 'finalization' : 'confirmation'}`,
+            );
         }
         await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
@@ -984,7 +1056,8 @@ export interface SubmitSettleAndDistributeArgs {
     readonly channelId: string;
     readonly currency?: string | undefined;
     readonly mint: string;
-    readonly network?: string | undefined;
+    /** Cluster the channel lives on; selects the deployment's treasury owner. */
+    readonly network: string;
     readonly payee: string;
     readonly payer: string;
     readonly programId?: Address | undefined;
@@ -993,9 +1066,7 @@ export interface SubmitSettleAndDistributeArgs {
      * rent at distribute. Required (no payer fallback).
      */
     readonly rentPayer: string;
-    readonly rpc: {
-        sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
-    };
+    readonly rpc: SettleRpc;
     readonly signer: TransactionSigner;
     readonly splits: readonly { readonly bps: number; readonly recipient: string }[];
     readonly tokenProgram?: string | undefined;
@@ -1005,6 +1076,19 @@ export interface SubmitSettleAndDistributeArgs {
               readonly signed: SignedVoucher;
           }
         | undefined;
+}
+
+/** RPC subset used by {@link submitSettleAndDistribute}. */
+export interface SettleRpc {
+    getAccountInfo: (
+        address: Address,
+        config: {
+            readonly commitment: 'confirmed';
+            readonly dataSlice: { readonly length: number; readonly offset: number };
+            readonly encoding: 'base64';
+        },
+    ) => { send: () => Promise<{ readonly value: { readonly owner: string } | null }> };
+    sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
 }
 
 /** Result of a settle-and-distribute submission. */
@@ -1040,6 +1124,7 @@ export async function submitSettleAndDistribute(
     const distribute = await buildDistributeInstruction({
         channelState: { channelId: args.channelId, payee: args.payee, payer: args.payer },
         mint: args.mint,
+        network: args.network,
         payerAddr: args.payer,
         programId: args.programId,
         rentPayer: args.rentPayer,
@@ -1047,7 +1132,19 @@ export async function submitSettleAndDistribute(
         tokenProgram,
     });
 
-    const instructions: ServerInstruction[] = [...settle.instructions, distribute];
+    const createAtas = await buildMissingAtaCreateInstructions({
+        mint: args.mint,
+        owners: {
+            payee: args.payee,
+            splitRecipients: args.splits.map(split => split.recipient),
+            treasury: treasuryOwnerForNetwork(args.network),
+        },
+        payer: args.signer,
+        rpc: args.rpc,
+        tokenProgram,
+    });
+
+    const instructions: ServerInstruction[] = [...settle.instructions, ...createAtas, distribute];
     const wire = await args.buildAndSignWireTransaction(instructions);
     const signature = await args.rpc.sendTransaction(wire, { encoding: 'base64' }).send();
     return { instructions, signature };
@@ -1059,8 +1156,100 @@ export async function submitSettleAndDistribute(
 
 const SYSTEM_PROGRAM_ADDRESS = '11111111111111111111111111111111' as Address<'11111111111111111111111111111111'>;
 
-function deriveTreasuryAddress(): Address {
-    return getBase58FromBytes(TREASURY_OWNER_BYTES);
+interface CompiledComputeBudgetInstruction {
+    readonly accountIndices?: readonly number[] | undefined;
+    readonly data?: Uint8Array | undefined;
+}
+
+/**
+ * Accept at most one SetComputeUnitLimit and one SetComputeUnitPrice, without
+ * accounts, within the caps. `sponsored` selects the tighter caps for
+ * transactions whose fee the operator pays.
+ */
+function validateComputeBudgetInstructions(
+    instructions: readonly CompiledComputeBudgetInstruction[],
+    options: { readonly label: string; readonly sponsored: boolean },
+): void {
+    const { label, sponsored } = options;
+    const maxUnits = sponsored ? MAX_SPONSORED_COMPUTE_UNIT_LIMIT : MAX_COMPUTE_UNIT_LIMIT;
+    const maxPrice = sponsored ? MAX_SPONSORED_COMPUTE_UNIT_PRICE_MICROLAMPORTS : MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS;
+    let seenLimit = false;
+    let seenPrice = false;
+    for (const ix of instructions) {
+        if ((ix.accountIndices ?? []).length !== 0) {
+            throw new Error(`${label}: compute budget instruction must not have accounts`);
+        }
+        const data = ix.data ?? new Uint8Array();
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        if (data[0] === 2 && data.length === 5) {
+            if (seenLimit) throw new Error(`${label}: duplicate SetComputeUnitLimit instruction`);
+            seenLimit = true;
+            const units = view.getUint32(1, true);
+            if (units > maxUnits) {
+                throw new Error(`${label}: compute unit limit ${units} exceeds maximum ${maxUnits}`);
+            }
+        } else if (data[0] === 3 && data.length === 9) {
+            if (seenPrice) throw new Error(`${label}: duplicate SetComputeUnitPrice instruction`);
+            seenPrice = true;
+            const price = view.getBigUint64(1, true);
+            if (price > maxPrice) {
+                throw new Error(`${label}: compute unit price ${price} exceeds maximum ${maxPrice}`);
+            }
+        } else {
+            throw new Error(`${label}: unsupported compute budget instruction`);
+        }
+    }
+}
+
+/**
+ * Owners whose ATAs the settling signer may fund. The payer ATA is
+ * client-controlled and deliberately not representable here.
+ */
+interface MerchantAtaOwners {
+    readonly payee: string;
+    readonly splitRecipients: readonly string[];
+    readonly treasury: string;
+}
+
+async function buildMissingAtaCreateInstructions(args: {
+    readonly mint: string;
+    readonly owners: MerchantAtaOwners;
+    readonly payer: TransactionSigner;
+    readonly rpc: SettleRpc;
+    readonly tokenProgram: string;
+}): Promise<ServerInstruction[]> {
+    const mint = address(args.mint);
+    const tokenProgram = address(args.tokenProgram);
+    const { payee, splitRecipients, treasury } = args.owners;
+    const owners = [...new Set([payee, treasury, ...splitRecipients])].map(owner => address(owner));
+    const atas = await Promise.all(
+        owners.map(async owner => (await findAssociatedTokenPda({ mint, owner, tokenProgram }))[0]),
+    );
+    const infos = await Promise.all(
+        atas.map(ata =>
+            args.rpc
+                .getAccountInfo(ata, {
+                    commitment: 'confirmed',
+                    dataSlice: { length: 0, offset: 0 },
+                    encoding: 'base64',
+                })
+                .send(),
+        ),
+    );
+    const instructions: ServerInstruction[] = [];
+    owners.forEach((owner, index) => {
+        if (infos[index]?.value?.owner === tokenProgram) return;
+        instructions.push(
+            getCreateAssociatedTokenIdempotentInstruction({
+                ata: atas[index],
+                mint,
+                owner,
+                payer: args.payer,
+                tokenProgram,
+            }) as unknown as ServerInstruction,
+        );
+    });
+    return instructions;
 }
 
 function getBase58FromBytes(bytes: Uint8Array): Address {

@@ -23,13 +23,20 @@ import {
     getTransactionEncoder,
     type KeyPairSigner,
 } from '@solana/kit';
+import { getSetComputeUnitLimitInstruction, getSetComputeUnitPriceInstruction } from '@solana-program/compute-budget';
+import { findAssociatedTokenPda } from '@solana-program/token';
 import { describe, expect, test } from 'vitest';
 
 import { ActiveSession, signSessionAuthentication } from '../client/Session.js';
+import { ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM } from '../constants.js';
 import { getChannelEncoder } from '../generated/payment-channels/accounts/channel.js';
 import { ChannelStatus } from '../generated/payment-channels/types/channelStatus.js';
 import { session } from '../server/Session.js';
-import { buildTopUpInstruction, PAYMENT_CHANNELS_PROGRAM_ID } from '../server/session/on-chain.js';
+import {
+    buildTopUpInstruction,
+    PAYMENT_CHANNELS_PROGRAM_ID,
+    type ServerInstruction,
+} from '../server/session/on-chain.js';
 import { type ChannelState, createMemorySessionStore, type SessionStore } from '../server/session/store.js';
 import { buildAndSignWireTransaction } from '../server/session/wire-tx.js';
 
@@ -46,28 +53,51 @@ const BLOCKHASH = 'EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N';
  * (open/topUp/settle broadcast), and `getSignatureStatuses`
  * (submitTopUpTx confirmation).
  */
-function mockRpc(options: { accountData?: string; confirmErr?: unknown; sendErrors?: number } = {}) {
+function mockRpc(
+    options: {
+        accountData?: string;
+        confirmErr?: unknown;
+        /** Confirmation levels served by successive status polls; the last one repeats. */
+        confirmationLevels?: readonly string[];
+        sendErrors?: number;
+        /** Addresses served as existing system-owned accounts. */
+        foreignAccounts?: ReadonlySet<string>;
+        /** Addresses served as existing token accounts. */
+        tokenAccounts?: ReadonlySet<string>;
+    } = {},
+) {
     let sendErrors = options.sendErrors ?? 0;
     const sent: string[] = [];
     const statusCalls: string[] = [];
+    const accountCommitments: unknown[] = [];
+    const levels = options.confirmationLevels ?? ['finalized'];
+    let statusPolls = 0;
     const rpc = {
-        getAccountInfo: () => ({
-            send: () =>
-                Promise.resolve({
-                    context: { slot: 314n },
-                    value:
-                        options.accountData === undefined
-                            ? null
-                            : {
-                                  data: [options.accountData, 'base64'],
-                                  executable: false,
-                                  lamports: 1_000_000n,
-                                  owner: PAYMENT_CHANNELS_PROGRAM_ID.toString(),
-                                  rentEpoch: 0n,
-                                  space: BigInt(getBase64Codec().encode(options.accountData).byteLength),
-                              },
-                }),
-        }),
+        getAccountInfo: (account: string, config?: { commitment?: unknown }) => {
+            accountCommitments.push(config?.commitment);
+            return {
+                send: () =>
+                    options.tokenAccounts?.has(account) || options.foreignAccounts?.has(account)
+                        ? Promise.resolve({
+                              context: { slot: 314n },
+                              value: { owner: options.tokenAccounts?.has(account) ? TOKEN_PROGRAM : SYSTEM_PROGRAM },
+                          })
+                        : Promise.resolve({
+                              context: { slot: 314n },
+                              value:
+                                  options.accountData === undefined
+                                      ? null
+                                      : {
+                                            data: [options.accountData, 'base64'],
+                                            executable: false,
+                                            lamports: 1_000_000n,
+                                            owner: PAYMENT_CHANNELS_PROGRAM_ID.toString(),
+                                            rentEpoch: 0n,
+                                            space: BigInt(getBase64Codec().encode(options.accountData).byteLength),
+                                        },
+                          }),
+            };
+        },
         getLatestBlockhash: () => ({
             send: () =>
                 Promise.resolve({
@@ -78,7 +108,10 @@ function mockRpc(options: { accountData?: string; confirmErr?: unknown; sendErro
         getSignatureStatuses: (sigs: readonly string[]) => ({
             send: () => {
                 statusCalls.push(...sigs);
-                return Promise.resolve({ value: sigs.map(() => ({ err: options.confirmErr ?? null })) });
+                const confirmationStatus = levels[Math.min(statusPolls++, levels.length - 1)];
+                return Promise.resolve({
+                    value: sigs.map(() => ({ confirmationStatus, err: options.confirmErr ?? null, slot: 314n })),
+                });
             },
         }),
         sendTransaction: (wire: string) => ({
@@ -92,7 +125,7 @@ function mockRpc(options: { accountData?: string; confirmErr?: unknown; sendErro
             },
         }),
     };
-    return { rpc, sent, statusCalls };
+    return { accountCommitments, rpc, sent, statusCalls };
 }
 
 interface Fixture {
@@ -216,7 +249,13 @@ async function verify(method: Method, credential: ReturnType<typeof makeCred>) {
 }
 
 /** Build a real, signed top-up wire transaction bound to the fixture channel. */
-async function buildTopUpWire(f: Fixture, rpc: unknown, amount: bigint, payerSigner?: KeyPairSigner): Promise<string> {
+async function buildTopUpWire(
+    f: Fixture,
+    rpc: unknown,
+    amount: bigint,
+    payerSigner?: KeyPairSigner,
+    prefix: readonly ServerInstruction[] = [],
+): Promise<string> {
     const payer = payerSigner ?? f.payer;
     const instruction = await buildTopUpInstruction({
         amount,
@@ -225,7 +264,7 @@ async function buildTopUpWire(f: Fixture, rpc: unknown, amount: bigint, payerSig
         payer,
         tokenProgram: TOKEN_PROGRAM,
     });
-    return await buildAndSignWireTransaction(rpc as never, payer, [instruction]);
+    return await buildAndSignWireTransaction(rpc as never, payer, [...prefix, instruction]);
 }
 
 /** Re-encode a v0 wire transaction as a legacy (unversioned) wire transaction. */
@@ -278,6 +317,71 @@ describe('session() verify() topUp', () => {
         expect(statusCalls).toContain('MockSig1');
         const state = await f.store.getChannel(f.channel.address);
         expect(state?.deposit).toBe(5_000n);
+    });
+
+    test('topUp is credited only once its signature finalizes, against finalized state', async () => {
+        const f = await makeFixture();
+        const { accountCommitments, rpc, statusCalls } = mockRpc({
+            accountData: channelAccountData(f, 5_000n),
+            confirmationLevels: ['confirmed', 'finalized'],
+        });
+        const method = makeMethod(f, rpc);
+        await seedChannel(f);
+
+        const wire = await buildTopUpWire(f, rpc, 4_000n);
+        accountCommitments.length = 0;
+        const receipt = await verify(
+            method,
+            makeCred(f, { action: 'topUp', additionalAmount: '4000', channelId: f.channel.address, transaction: wire }),
+        );
+
+        expect(receipt.status).toBe('success');
+        expect(statusCalls.filter(sig => sig === 'MockSig1')).toHaveLength(2);
+        expect(accountCommitments).toEqual(['finalized']);
+        expect((await f.store.getChannel(f.channel.address))?.deposit).toBe(5_000n);
+    });
+
+    test('topUp accepts Compute Budget instructions within the caps', async () => {
+        const f = await makeFixture();
+        const { rpc, sent } = mockRpc({ accountData: channelAccountData(f, 5_000n) });
+        const method = makeMethod(f, rpc);
+        await seedChannel(f);
+
+        const budget = [
+            getSetComputeUnitLimitInstruction({ units: 400_000 }),
+            getSetComputeUnitPriceInstruction({ microLamports: 5_000_000n }),
+        ] as unknown as ServerInstruction[];
+        const wire = await buildTopUpWire(f, rpc, 4_000n, undefined, budget);
+        const receipt = await verify(
+            method,
+            makeCred(f, { action: 'topUp', additionalAmount: '4000', channelId: f.channel.address, transaction: wire }),
+        );
+        expect(receipt.status).toBe('success');
+        expect(sent).toHaveLength(1);
+    });
+
+    test('topUp rejects an excessive Compute Budget price before broadcasting', async () => {
+        const f = await makeFixture();
+        const { rpc, sent } = mockRpc({ accountData: channelAccountData(f, 5_000n) });
+        const method = makeMethod(f, rpc);
+        await seedChannel(f);
+
+        const budget = [
+            getSetComputeUnitPriceInstruction({ microLamports: 5_000_001n }),
+        ] as unknown as ServerInstruction[];
+        const wire = await buildTopUpWire(f, rpc, 4_000n, undefined, budget);
+        await expect(
+            verify(
+                method,
+                makeCred(f, {
+                    action: 'topUp',
+                    additionalAmount: '4000',
+                    channelId: f.channel.address,
+                    transaction: wire,
+                }),
+            ),
+        ).rejects.toThrow(/submitTopUpTx: compute unit price 5000001 exceeds maximum 5000000/);
+        expect(sent).toHaveLength(0);
     });
 
     test('a resubmitted top-up transaction credits the deposit exactly once', async () => {
@@ -502,10 +606,14 @@ describe('session() verify() topUp', () => {
 
 // ── verify() — close final-voucher monotonicity + idempotent replay ──────
 
-async function watermarkedFixture(rpcOptions: { sendErrors?: number } = {}) {
-    const f = await makeFixture();
+async function watermarkedFixture(
+    rpcOptions: Parameters<typeof mockRpc>[0] = {},
+    methodOverrides: Record<string, unknown> = {},
+    fixture?: Fixture,
+) {
+    const f = fixture ?? (await makeFixture());
     const mock = mockRpc(rpcOptions);
-    const method = makeMethod(f, mock.rpc);
+    const method = makeMethod(f, mock.rpc, methodOverrides);
     await seedChannel(f);
 
     const active = new ActiveSession({ channelId: f.channel.address, signer: f.sessionSigner });
@@ -516,7 +624,7 @@ async function watermarkedFixture(rpcOptions: { sendErrors?: number } = {}) {
 
 describe('session() verify() close monotonicity', () => {
     test('an accepted voucher advances the watermark', async () => {
-        const { f, method, receipt, voucher } = await watermarkedFixture();
+        const { active, f, method, receipt, voucher } = await watermarkedFixture();
         expect(receipt.status).toBe('success');
         expect(receipt.reference).toBe(f.channel.address);
         expect(receipt).toMatchObject({
@@ -530,16 +638,21 @@ describe('session() verify() close monotonicity', () => {
         expect(state?.cumulative).toBe(250n);
         expect(state?.highestVoucherSignature).toBe(voucher.signature);
 
-        // An idempotent replay of the already-accepted highest voucher must
-        // not deliver additional service or debit `spent` again — repeated
-        // replays keep returning the same cached amount.
-        const replay = await verify(method, makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher }));
-        expect(replay).toMatchObject({ acceptedCumulative: '250', spent: '100' });
-        const replayAgain = await verify(
+        // A replay of the accepted voucher authorizes no further request and
+        // leaves the channel untouched.
+        const before = await f.store.getChannel(f.channel.address);
+        await expect(
+            verify(method, makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher })),
+        ).rejects.toThrow(/already accepted/);
+        expect(await f.store.getChannel(f.channel.address)).toEqual(before);
+
+        // The next request is paid with a fresh voucher.
+        const next = await active.prepareVoucher(500n);
+        const fresh = await verify(
             method,
-            makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher }),
+            makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher: next }),
         );
-        expect(replayAgain).toMatchObject({ acceptedCumulative: '250', spent: '100' });
+        expect(fresh).toMatchObject({ acceptedCumulative: '500', spent: '200' });
     });
 
     test('a voucher action whose top-level channelId diverges from the signed voucher is rejected', async () => {
@@ -623,6 +736,168 @@ describe('session() verify() close monotonicity', () => {
         expect(state?.highestVoucherSignature).toBe(finalVoucher.signature);
         expect(state?.sealed).toBe(true);
         expect(state?.settledOnChain).toBe(750n);
+    });
+});
+
+/** Decode a sent wire transaction into program / account addresses / data per instruction. */
+function decodeSent(wire: string): { accounts: string[]; data: Uint8Array; program: string }[] {
+    const tx = getTransactionDecoder().decode(getBase64Codec().encode(wire));
+    const message = getCompiledTransactionMessageDecoder().decode(tx.messageBytes) as unknown as {
+        instructions: readonly {
+            accountIndices?: readonly number[];
+            data?: Uint8Array;
+            programAddressIndex: number;
+        }[];
+        staticAccounts: readonly string[];
+    };
+    return message.instructions.map(ix => ({
+        accounts: (ix.accountIndices ?? []).map(index => message.staticAccounts[index]!),
+        data: ix.data ?? new Uint8Array(),
+        program: message.staticAccounts[ix.programAddressIndex]!,
+    }));
+}
+
+async function usdcAta(owner: string): Promise<string> {
+    const [ata] = await findAssociatedTokenPda({
+        mint: address(USDC_DEVNET_MINT),
+        owner: address(owner),
+        tokenProgram: address(TOKEN_PROGRAM),
+    });
+    return ata;
+}
+
+describe('session() close settlement treasury', () => {
+    // ATA(4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap, USDC_DEVNET_MINT, TOKEN_PROGRAM)
+    const DEVNET_TREASURY_ATA = 'BSMX9adNvtMHhBSbiuDeaPZZbF82cmPJkSHyptJSHecz';
+    // ATA(Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP, USDC_DEVNET_MINT, TOKEN_PROGRAM)
+    const MAINNET_TREASURY_ATA = 'FhCMrXE7ciBXZpSwuNwPT4HTkWcsUaMkFrUvDGJD8sP2';
+
+    test('a devnet close distributes to the devnet treasury ATA', async () => {
+        const { f, method, sent, voucher } = await watermarkedFixture();
+
+        const receipt = await verify(method, makeCred(f, { action: 'close', channelId: f.channel.address, voucher }));
+        expect(receipt.status).toBe('success');
+        expect(sent).toHaveLength(1);
+
+        const distribute = decodeSent(sent[0]!).find(
+            ix => ix.program === PAYMENT_CHANNELS_PROGRAM_ID.toString() && ix.data[0] === 7,
+        );
+        expect(distribute).toBeDefined();
+        const treasuryAta = distribute!.accounts[6];
+        expect(treasuryAta).toBe(DEVNET_TREASURY_ATA);
+        expect(treasuryAta).not.toBe(MAINNET_TREASURY_ATA);
+    });
+
+    test('session construction rejects a network without a known deployment', async () => {
+        const f = await makeFixture();
+        expect(() => makeMethod(f, mockRpc().rpc, { currency: USDC_DEVNET_MINT, network: 'testnet' })).toThrow(
+            /Unsupported network "testnet"/,
+        );
+    });
+});
+
+describe('session() close settlement destination ATAs', () => {
+    const DEVNET_TREASURY = '4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap';
+
+    /**
+     * Close a watermarked channel and return every idempotent ATA create in
+     * the settle transaction. `existing` / `foreign` pick owners whose USDC
+     * ATA address is served as a token account / a system-owned account.
+     */
+    async function closeAndInspect(options: {
+        existing?: (f: Fixture) => readonly string[];
+        foreign?: (f: Fixture) => readonly string[];
+        splits?: (f: Fixture) => readonly { recipient: string; shareBps: number }[];
+    }) {
+        const f = await makeFixture();
+        const atasOf = async (owners: readonly string[]) => new Set(await Promise.all(owners.map(usdcAta)));
+        const tokenAccounts = await atasOf(options.existing?.(f) ?? []);
+        const foreignAccounts = await atasOf(options.foreign?.(f) ?? []);
+        const { method, sent, voucher } = await watermarkedFixture(
+            { foreignAccounts, tokenAccounts },
+            options.splits ? { distributionSplits: options.splits(f) } : {},
+            f,
+        );
+
+        const receipt = await verify(method, makeCred(f, { action: 'close', channelId: f.channel.address, voucher }));
+        expect(receipt.status).toBe('success');
+        expect(sent).toHaveLength(1);
+        const instructions = decodeSent(sent[0]!);
+        const creates = instructions
+            .filter(ix => ix.program === ASSOCIATED_TOKEN_PROGRAM)
+            .map(ix => ({
+                ata: ix.accounts[1],
+                data: Array.from(ix.data),
+                owner: ix.accounts[2],
+                payer: ix.accounts[0],
+            }));
+        const distributeIndex = instructions.findIndex(
+            ix => ix.program === PAYMENT_CHANNELS_PROGRAM_ID.toString() && ix.data[0] === 7,
+        );
+        const lastCreateIndex = instructions.map(ix => ix.program).lastIndexOf(ASSOCIATED_TOKEN_PROGRAM);
+        return { creates, distributeIndex, f, lastCreateIndex };
+    }
+
+    test('missing payee and treasury ATAs are created before distribute', async () => {
+        const { creates, distributeIndex, f, lastCreateIndex } = await closeAndInspect({
+            existing: f => [f.payer.address],
+        });
+
+        expect(creates).toEqual(
+            await Promise.all(
+                [f.merchant.address, DEVNET_TREASURY].map(async owner => ({
+                    ata: await usdcAta(owner),
+                    data: [1],
+                    owner,
+                    payer: f.merchant.address,
+                })),
+            ),
+        );
+        expect(lastCreateIndex).toBeLessThan(distributeIndex);
+    });
+
+    test('a missing payer ATA is never created by the merchant', async () => {
+        const { creates, f } = await closeAndInspect({ existing: f => [f.merchant.address, DEVNET_TREASURY] });
+
+        expect(creates).toEqual([]);
+        expect(creates.map(create => create.ata)).not.toContain(await usdcAta(f.payer.address));
+    });
+
+    test('only the missing payee ATA is created', async () => {
+        const { creates, f } = await closeAndInspect({ existing: f => [f.payer.address, DEVNET_TREASURY] });
+
+        expect(creates.map(create => create.owner)).toEqual([f.merchant.address]);
+    });
+
+    test('existing destination ATAs add no create instructions', async () => {
+        const { creates } = await closeAndInspect({
+            existing: f => [f.payer.address, f.merchant.address, DEVNET_TREASURY],
+        });
+
+        expect(creates).toEqual([]);
+    });
+
+    test('a system-owned account at the ATA address is still created', async () => {
+        // Lamports sent to an uninitialized ATA address leave it system-owned.
+        const { creates, f } = await closeAndInspect({
+            existing: f => [f.payer.address, DEVNET_TREASURY],
+            foreign: f => [f.merchant.address],
+        });
+
+        expect(creates.map(create => create.owner)).toEqual([f.merchant.address]);
+    });
+
+    test('split recipient ATAs are created once each, deduplicated against the payee', async () => {
+        const splitRecipient = (await generateKeyPairSigner()).address;
+        const { creates, f } = await closeAndInspect({
+            existing: f => [f.payer.address, DEVNET_TREASURY],
+            splits: f => [
+                { recipient: splitRecipient, shareBps: 500 },
+                { recipient: f.merchant.address, shareBps: 250 },
+            ],
+        });
+
+        expect(creates.map(create => create.owner)).toEqual([f.merchant.address, splitRecipient]);
     });
 });
 

@@ -18,7 +18,7 @@ import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from solana_keychain import TransactionSigner
 from solders.hash import Hash  # type: ignore[import-untyped]
@@ -603,20 +603,33 @@ def new_top_up_tx_verifier(
             if status is None or status.get("err") is not None:
                 raise
             signature = landed
-        await confirm_transaction_signature(rpc_client, signature, "top-up")
+        # A confirmed top-up can still be forked out: credit only a finalized
+        # signature, against finalized channel state no older than its slot.
+        # Concurrent top-ups may raise the deposit further, so require >=.
+        slot = await confirm_transaction_signature(
+            rpc_client, signature, "top-up", commitment="finalized", timeout_seconds=60.0
+        )
+        if slot is None:
+            raise PaymentError("finalized top-up status carried no slot", code="transaction-not-confirmed")
         if amount > _U64_MAX - state.deposit:
             raise PaymentError("top-up deposit overflows u64", code="invalid-payload")
         await _verify_channel_account(
             rpc_client,
             state.channel_id,
             program_id=program_id,
-            expected={"deposit": state.deposit + amount},
+            expected={},
+            commitment="finalized",
+            min_context_slot=slot,
+            minimum_deposit=state.deposit + amount,
         )
 
     return verifier
 
 
 _U64_MAX = (1 << 64) - 1
+#: How long a slot-pinned channel read waits for a lagging RPC node.
+_SLOT_PINNED_READ_TIMEOUT_SECONDS = 30.0
+_SLOT_PINNED_READ_POLL_SECONDS = 1.0
 
 
 async def _verify_channel_account(
@@ -625,11 +638,33 @@ async def _verify_channel_account(
     *,
     program_id: Pubkey,
     expected: dict[str, Any],
+    commitment: Literal["confirmed", "finalized"] = "confirmed",
+    min_context_slot: int | None = None,
+    minimum_deposit: int | None = None,
 ) -> None:
-    """Fetch and compare the authoritative channel account after confirmation."""
+    """Fetch and compare the authoritative channel account after confirmation.
+
+    With ``min_context_slot`` the read must come from a node at or past that
+    slot; a lagging node is re-polled until the deadline, then refused.
+    """
     from solana_pay_kit._paycore.paymentchannels import decode_channel_account
 
-    response = await rpc_client.get_account_info(Pubkey.from_string(channel_id), commitment="confirmed")
+    deadline = time.monotonic() + _SLOT_PINNED_READ_TIMEOUT_SECONDS
+    while True:
+        response = await rpc_client.get_account_info(Pubkey.from_string(channel_id), commitment=commitment)
+        if min_context_slot is None:
+            break
+        context_slot = getattr(getattr(response, "context", None), "slot", None)
+        if not isinstance(context_slot, int):
+            raise PaymentError("channel read carried no context slot", code="transaction-not-confirmed")
+        if context_slot >= min_context_slot:
+            break
+        if time.monotonic() >= deadline:
+            raise PaymentError(
+                f"channel read at slot {context_slot} is behind transaction slot {min_context_slot}",
+                code="transaction-not-confirmed",
+            )
+        await asyncio.sleep(_SLOT_PINNED_READ_POLL_SECONDS)
     info = getattr(response, "value", None)
     if info is None:
         raise PaymentError("confirmed channel account was not found", code="transaction-not-found")
@@ -652,6 +687,11 @@ async def _verify_channel_account(
     }
     if channel.status != 0:
         raise PaymentError("channel is not open after transaction confirmation", code="transaction-failed")
+    if minimum_deposit is not None and channel.deposit < minimum_deposit:
+        raise PaymentError(
+            "channel account deposit does not reflect the confirmed transaction",
+            code="transaction-failed",
+        )
     for field, value in expected.items():
         if actual[field] != value:
             raise PaymentError(
@@ -665,11 +705,12 @@ async def confirm_transaction_signature(
     signature: str,
     label: str,
     *,
+    commitment: Literal["confirmed", "finalized"] = "confirmed",
     timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 1.0,
-) -> None:
+) -> int | None:
     """Poll ``getSignatureStatuses`` until ``signature`` reaches at least
-    ``confirmed`` commitment, or raise.
+    ``commitment``, or raise. Returns the status slot when the RPC reports one.
 
     ``label`` names the transaction in error messages ("open", "top-up",
     "settle"). A freshly broadcast signature commonly returns ``None`` from
@@ -706,17 +747,22 @@ async def confirm_transaction_signature(
                     f"{label} tx {signature!r} failed on-chain: {status['err']}", code="transaction-failed"
                 )
             level = status.get("confirmationStatus")
-            # RPC endpoints that omit ``confirmationStatus`` only report a
-            # status once the transaction has landed; treat that as
-            # confirmed, mirroring the TS helper.
-            if level is None or level in ("confirmed", "finalized"):
-                return
+            slot = status.get("slot")
+            slot = slot if isinstance(slot, int) else None
+            if commitment == "finalized":
+                if level == "finalized":
+                    return slot
+            elif level is None or level in ("confirmed", "finalized"):
+                # RPC endpoints that omit ``confirmationStatus`` only report a
+                # status once the transaction has landed; treat that as
+                # confirmed, mirroring the TS helper.
+                return slot
 
         now = time.monotonic()
         if now >= deadline:
             if saw_status:
                 raise PaymentError(
-                    f"{label} tx {signature!r} not confirmed within {timeout_seconds}s",
+                    f"{label} tx {signature!r} not {commitment} within {timeout_seconds}s",
                     code="transaction-not-confirmed",
                 )
             raise PaymentError(

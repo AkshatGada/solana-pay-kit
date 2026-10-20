@@ -2,8 +2,11 @@
 //!
 //! Builds the activation transaction defined by `draft-solana-subscription-00`:
 //!
-//!   `[compute_budget_*, initialize_subscription_authority?, subscribe,
+//!   `[compute_budget_*, create_ata_idempotent, subscribe,
 //!     transfer_subscription, memo(externalId)?]`
+//!
+//! A missing `SubscriptionAuthority` is initialized in its own transaction
+//! first; servers reject it inside the activation transaction.
 //!
 //! The transaction is signed (or partially signed when the server is fee
 //! payer) and returned as a `CredentialPayload::Transaction` ready to send
@@ -19,7 +22,7 @@ use solana_rpc_client::rpc_client::RpcClient;
 
 use crate::mpp::error::Error;
 use crate::mpp::program::subscriptions::{
-    find_subscription_authority_pda, find_subscription_pda, parse_pubkey,
+    default_program_id, find_subscription_authority_pda, find_subscription_pda, parse_pubkey,
 };
 use crate::mpp::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::mpp::protocol::intents::{
@@ -56,6 +59,34 @@ pub struct BuildSubscriptionActivationOptions {
     /// skips the on-chain SA lookup and the init-tx broadcast — useful for
     /// tests, and for callers that have already resolved the SA state.
     pub subscription_authority_init_id: Option<i64>,
+    /// Subscriptions program deployment the caller trusts. `None` trusts only
+    /// the canonical
+    /// [`SUBSCRIPTIONS_PROGRAM_ID`](crate::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID); a challenge naming any
+    /// other program is rejected before anything is signed.
+    pub trusted_subscription_program: Option<Pubkey>,
+}
+
+/// Resolve the challenge's `subscriptionProgram`, refusing any program the
+/// caller has not chosen to trust: the program receives the subscriber's
+/// signature and token account.
+fn trusted_subscription_program(
+    method_details: &SubscriptionMethodDetails,
+    trusted: Option<Pubkey>,
+) -> Result<Pubkey, Error> {
+    let program_id = parse_pubkey(
+        method_details
+            .subscription_program
+            .as_deref()
+            .ok_or_else(|| Error::Other("methodDetails.subscriptionProgram is required".into()))?,
+        "subscriptionProgram",
+    )?;
+    let trusted = trusted.unwrap_or_else(default_program_id);
+    if program_id != trusted {
+        return Err(Error::Other(format!(
+            "Untrusted subscription program {program_id} (expected {trusted})"
+        )));
+    }
+    Ok(program_id)
 }
 
 /// Activation credential plus the reusable proof needed for later access.
@@ -112,19 +143,8 @@ pub async fn build_subscription_activation_credential(
     challenge: &PaymentChallenge,
 ) -> Result<SubscriptionActivation, Error> {
     let request: SubscriptionRequest = challenge.request.decode()?;
-    let method_details = request
-        .method_details
-        .as_ref()
-        .ok_or_else(|| Error::Other("Subscription request is missing methodDetails".into()))?;
-    let method_details = SubscriptionMethodDetails::from_json(method_details)?;
-    method_details.validate()?;
-    let program_id = parse_pubkey(
-        method_details
-            .subscription_program
-            .as_deref()
-            .ok_or_else(|| Error::Other("methodDetails.subscriptionProgram is required".into()))?,
-        "subscriptionProgram",
-    )?;
+    let method_details = request.validated_method_details()?;
+    let program_id = trusted_subscription_program(&method_details, None)?;
     let plan_id = parse_pubkey(&method_details.plan_address, "planAddress")?;
     let subscription_delegation = find_subscription_pda(&plan_id, &signer.pubkey(), &program_id)
         .0
@@ -196,13 +216,8 @@ pub async fn build_subscription_activation_transaction_with_options(
     method_details: &SubscriptionMethodDetails,
     options: BuildSubscriptionActivationOptions,
 ) -> Result<CredentialPayload, Error> {
-    let program_id = parse_pubkey(
-        method_details
-            .subscription_program
-            .as_deref()
-            .ok_or_else(|| Error::Other("methodDetails.subscriptionProgram is required".into()))?,
-        "subscriptionProgram",
-    )?;
+    let program_id =
+        trusted_subscription_program(method_details, options.trusted_subscription_program)?;
 
     let subscriber = signer.pubkey();
     let mint = parse_pubkey(&method_details.mint, "mint")?;
@@ -927,5 +942,138 @@ mod tests {
         let limit_ix = crate::core::tx::unit_limit_instruction(200_000);
         assert_eq!(limit_ix.data[0], 2);
         assert_eq!(limit_ix.data.len(), 5);
+    }
+
+    fn challenge_for(request: &SubscriptionRequest) -> PaymentChallenge {
+        PaymentChallenge::new(
+            "challenge-id",
+            "realm",
+            "solana",
+            "subscription",
+            crate::mpp::protocol::core::Base64UrlJson::from_typed(request).unwrap(),
+        )
+    }
+
+    fn request_for(md: &SubscriptionMethodDetails) -> SubscriptionRequest {
+        SubscriptionRequest {
+            amount: md.amount.clone().unwrap(),
+            currency: md.mint.clone(),
+            period_unit: crate::mpp::protocol::intents::SubscriptionPeriodUnit::Day,
+            period_count: "30".into(),
+            recipient: md.recipient.clone().unwrap(),
+            method_details: Some(serde_json::to_value(md).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn activation_credential_rejects_currency_differing_from_signed_mint() {
+        let signer = make_signer();
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let md = make_method_details(false, None);
+        let mut request = request_for(&md);
+        // Displayed as USDT while the transaction would authorize USDC.
+        request.currency = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".into();
+
+        let err = build_subscription_activation_credential(
+            signer.as_ref(),
+            &rpc,
+            &challenge_for(&request),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("currency"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn activation_credential_rejects_amount_differing_from_signed_amount() {
+        let signer = make_signer();
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let md = make_method_details(false, None);
+        let mut request = request_for(&md);
+        request.amount = "1".into();
+
+        assert!(build_subscription_activation_credential(
+            signer.as_ref(),
+            &rpc,
+            &challenge_for(&request)
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn untrusted_subscription_program_is_rejected_before_signing() {
+        let signer = make_signer();
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let mut md = make_method_details(false, None);
+        md.subscription_program = Some(Pubkey::new_unique().to_string());
+
+        let err = build_subscription_activation_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            &md,
+            pinned_options(BuildSubscriptionActivationOptions::default()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Untrusted subscription program"),
+            "{err}"
+        );
+
+        let request = request_for(&md);
+        let err = build_subscription_activation_credential(
+            signer.as_ref(),
+            &rpc,
+            &challenge_for(&request),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Untrusted subscription program"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caller_trusted_subscription_program_is_used() {
+        let signer = make_signer();
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let custom = Pubkey::new_unique();
+        let mut md = make_method_details(false, None);
+        md.subscription_program = Some(custom.to_string());
+
+        let CredentialPayload::Transaction { transaction } =
+            build_subscription_activation_transaction_with_options(
+                signer.as_ref(),
+                &rpc,
+                &md,
+                pinned_options(BuildSubscriptionActivationOptions {
+                    trusted_subscription_program: Some(custom),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected transaction payload")
+        };
+        let tx = crate::core::tx::decode(&transaction).unwrap();
+        assert!(tx.message.static_account_keys().contains(&custom));
+
+        // Trusting a custom deployment does not also trust the canonical one.
+        md.subscription_program = Some(SUBSCRIPTIONS_PROGRAM_ID.into());
+        assert!(build_subscription_activation_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            &md,
+            pinned_options(BuildSubscriptionActivationOptions {
+                trusted_subscription_program: Some(custom),
+                ..Default::default()
+            }),
+        )
+        .await
+        .is_err());
     }
 }

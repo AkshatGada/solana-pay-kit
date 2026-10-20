@@ -38,11 +38,13 @@ import { createLifecycle, type Lifecycle } from './session/lifecycle.js';
 import {
     OPEN_SLOT_WINDOW,
     PAYMENT_CHANNELS_PROGRAM_ID,
+    type SettleRpc,
     submitOpenTx,
     submitSettleAndDistribute,
     type SubmitSettleAndDistributeResult,
     submitTopUpTx,
     transactionSignatureFromWire,
+    treasuryOwnerForNetwork,
     verifyOpenTx,
 } from './session/on-chain.js';
 import {
@@ -149,6 +151,8 @@ export function session(parameters: session.Parameters) {
     const operator = operatorVoucherSigner?.address;
     const store = resolveSessionStore(parameters);
     const resolvedProgramId = (channelProgram ?? PAYMENT_CHANNELS_PROGRAM_ID) as Address;
+    // Settlement derives the treasury ATA per cluster; reject unknown networks up front.
+    treasuryOwnerForNetwork(network);
     const resolvedMint = resolveStablecoinMint(currency, network);
     if (!resolvedMint) throw new Error('session currency must be an SPL token mint; use wrapped SOL instead of SOL');
     const resolvedDecimals = decimals ?? (stablecoinSymbolForCurrency(resolvedMint) ? 6 : undefined);
@@ -840,10 +844,8 @@ async function handleVoucher(args: HandleVoucherArgs): Promise<Receipt.Receipt> 
             throw new Error(`${result.reason}: ${result.detail}`);
         }
         if (result.status === 'replayed') {
-            // An idempotent replay of the already-accepted highest voucher
-            // must not deliver additional service or debit spentAmount
-            // again — the client already paid for it.
-            return { ...current, lastActivityAt: Date.now() };
+            // Each voucher authorizes one request; a replay changes no state.
+            throw new Error('voucher was already accepted; sign a new voucher for this request');
         }
         if (result.newCumulative - current.spentAmount < args.price) {
             throw new Error('insufficient authorized voucher availability');
@@ -1358,9 +1360,7 @@ async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSe
 
         programId: args.programId,
         rentPayer: state.rentPayer,
-        rpc: args.rpc as unknown as {
-            sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
-        },
+        rpc: args.rpc as unknown as SettleRpc,
         signer: args.merchantSigner as unknown as TransactionSigner,
         splits: args.splits ?? [],
         tokenProgram: args.tokenProgram,

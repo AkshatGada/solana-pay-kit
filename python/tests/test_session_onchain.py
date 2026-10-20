@@ -347,10 +347,13 @@ async def test_verify_open_tx_rejects_bad_encoding_and_fee_payer() -> None:
 class _MainnetLikeRpc:
     """Mock RPC that, like mainnet, rejects a duplicate send at preflight."""
 
-    def __init__(self, *, account: object | None, status: dict | None) -> None:
+    def __init__(self, *, account: object | None, status: dict | None, context_slots: list[int] | None = None) -> None:
         self.sent: list[bytes] = []
         self.account = account
         self.status = status
+        # Context slot served by successive account reads; the last repeats.
+        self.context_slots = context_slots or [100]
+        self.reads = 0
 
     async def send_raw_transaction(self, raw_tx: bytes) -> object:
         if raw_tx in self.sent:
@@ -371,7 +374,9 @@ class _MainnetLikeRpc:
         del commitment
         from types import SimpleNamespace
 
-        return SimpleNamespace(value=self.account)
+        slot = self.context_slots[min(self.reads, len(self.context_slots) - 1)]
+        self.reads += 1
+        return SimpleNamespace(value=self.account, context=SimpleNamespace(slot=slot))
 
     async def get_latest_blockhash(self, commitment: str = "confirmed") -> object:
         del commitment
@@ -382,7 +387,7 @@ def _first_signature(raw_tx: bytes) -> str:
     return str(VersionedTransaction.from_bytes(raw_tx).signatures[0])
 
 
-_LANDED_CLEAN = {"err": None, "confirmationStatus": "finalized"}
+_LANDED_CLEAN = {"err": None, "confirmationStatus": "finalized", "slot": 100}
 
 
 def _open_config(fixture: _Fixture) -> SessionConfig:
@@ -533,4 +538,96 @@ async def test_top_up_verifier_keeps_broadcast_error_when_signature_never_landed
     rpc.sent.append(base64.b64decode(payload.transaction))
     verifier = await _seeded_top_up_verifier(rpc, state)
     with pytest.raises(RuntimeError, match="already been processed"):
+        await verifier(payload)
+
+
+class _FinalizingRpc(_MainnetLikeRpc):
+    """Reports ``confirmed`` first, then ``finalized``; records read commitments."""
+
+    def __init__(self, *, account: object | None) -> None:
+        super().__init__(account=account, status=None)
+        self.levels = ["confirmed", "finalized"]
+        self.polls = 0
+        self.commitments: list[str] = []
+
+    async def get_signature_statuses(self, signatures: list[str]) -> list[dict | None]:
+        del signatures
+        level = self.levels[min(self.polls, len(self.levels) - 1)]
+        self.polls += 1
+        return [{"err": None, "confirmationStatus": level, "slot": 100}]
+
+    async def get_account_info(self, _addr: object, commitment: str = "confirmed") -> object:
+        self.commitments.append(commitment)
+        return await super().get_account_info(_addr, commitment)
+
+
+async def test_top_up_verifier_credits_only_a_finalized_signature_against_finalized_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _FinalizingRpc(account=account)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain.asyncio.sleep", no_sleep)
+    await verifier(payload)
+    assert rpc.polls == 2
+    assert rpc.commitments == ["finalized"]
+
+
+@pytest.fixture
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain.asyncio.sleep", no_sleep)
+
+
+@pytest.mark.usefixtures("_no_sleep")
+async def test_top_up_verifier_waits_for_a_lagging_finalized_read() -> None:
+    # The first read comes from a node behind the finalized status slot; the
+    # verifier re-reads instead of trusting stale state.
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN, context_slots=[90, 99, 100])
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    await verifier(payload)
+    assert rpc.reads == 3
+
+
+@pytest.mark.usefixtures("_no_sleep")
+async def test_top_up_verifier_refuses_a_read_that_never_reaches_the_status_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("solana_pay_kit.protocols.mpp.server.session_onchain._SLOT_PINNED_READ_TIMEOUT_SECONDS", 0.0)
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN, context_slots=[90])
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="behind transaction slot"):
+        await verifier(payload)
+
+
+async def test_top_up_verifier_refuses_a_finalized_status_without_a_slot() -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_250)
+    rpc = _MainnetLikeRpc(account=account, status={"err": None, "confirmationStatus": "finalized"})
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="no slot"):
+        await verifier(payload)
+
+
+async def test_top_up_verifier_credits_alongside_a_concurrent_top_up() -> None:
+    # Another top-up landed in the same window: the finalized deposit exceeds
+    # this top-up's expectation and must still verify.
+    payload, state, account = _top_up_scenario(deposit_after=1_250 + 500)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    await verifier(payload)
+
+
+async def test_top_up_verifier_rejects_a_deposit_below_the_top_up() -> None:
+    payload, state, account = _top_up_scenario(deposit_after=1_249)
+    rpc = _MainnetLikeRpc(account=account, status=_LANDED_CLEAN)
+    verifier = await _seeded_top_up_verifier(rpc, state)
+    with pytest.raises(PaymentError, match="deposit does not reflect"):
         await verifier(payload)

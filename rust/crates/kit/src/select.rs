@@ -62,7 +62,8 @@ pub enum OrderingStrategy {
 /// The option [`select_payment`] chose, carrying everything needed to settle.
 #[derive(Debug, Clone)]
 pub enum SelectedPayment {
-    /// Settle via an MPP charge challenge.
+    /// Settle via an MPP charge challenge. Pass `network` to the builder as
+    /// `expected_network` so the signed transaction matches what was selected.
     MppCharge {
         challenge: Box<PaymentChallenge>,
         mint: String,
@@ -448,7 +449,8 @@ fn collect_candidates(headers: &[(String, String)], body: Option<&str>) -> Vec<C
 }
 
 /// Normalize one MPP charge challenge to a [`Candidate`]. Returns `None` for
-/// non-charge, SOL-denominated, or unparseable challenges.
+/// non-charge, SOL-denominated, unsupported-network, or unparseable
+/// challenges.
 fn mpp_candidate(challenge: &PaymentChallenge, order: usize) -> Option<Candidate> {
     if !is_solana_charge_challenge(challenge) {
         return None;
@@ -462,7 +464,8 @@ fn mpp_candidate(challenge: &PaymentChallenge, order: usize) -> Option<Candidate
         .clone()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let network = normalize_network(details.network.as_deref().unwrap_or("mainnet"));
+    let network =
+        crate::mpp::protocol::solana::canonical_network(details.network.as_deref())?.to_string();
     let mint = resolve_mint(&request.currency, &network)?;
     let amount = request.amount.parse::<u64>().ok()?;
     Some(Candidate {
@@ -477,23 +480,21 @@ fn mpp_candidate(challenge: &PaymentChallenge, order: usize) -> Option<Candidate
 }
 
 /// Normalize one x402 accept to a [`Candidate`]. Returns `None` for
-/// SOL-denominated, unparseable, or non-Solana requirements.
+/// SOL-denominated, non-`exact`, unparseable, or non-Solana requirements.
 fn x402_candidate(requirement: &PaymentRequirements, order: usize) -> Option<Candidate> {
-    if requirement.currency.eq_ignore_ascii_case("SOL") {
+    if requirement.currency.eq_ignore_ascii_case("SOL") || !requirement.is_exact_scheme() {
         return None;
     }
-    // Resolve the canonical CAIP-2 `network` (e.g. "solana:EtWT…" for devnet)
-    // — or an explicit `cluster` — to a cluster slug. A plain substring scan
-    // would miss CAIP-2 genesis-hash ids and mislabel them mainnet, so go
-    // through `cluster_for_caip2_network`, which also handles the short forms.
-    // `None` means the offer isn't on a recognized Solana network → skip it.
-    let cluster = cluster_for_caip2_network(&requirement.network).or_else(|| {
-        requirement
-            .cluster
-            .as_deref()
-            .and_then(cluster_for_caip2_network)
-    })?;
-    let network = normalize_network(cluster);
+    // Resolve the CAIP-2 `network` (e.g. "solana:EtWT…" for devnet) to a
+    // cluster slug; an unrecognized network, or an explicit `cluster` that
+    // disagrees with it, means the offer is skipped.
+    let cluster = cluster_for_caip2_network(&requirement.network)?;
+    if let Some(explicit) = requirement.cluster.as_deref() {
+        if cluster_for_caip2_network(explicit) != Some(cluster) {
+            return None;
+        }
+    }
+    let network = cluster_slug(cluster);
     let mint = resolve_mint(&requirement.currency, &network)?;
     let amount = requirement.amount.parse::<u64>().ok()?;
     Some(Candidate {
@@ -517,7 +518,7 @@ fn x402_upto_candidate(requirement: &UptoRequirements, order: usize) -> Option<C
     }
     // upto carries only the CAIP-2 `network` (no separate human `cluster`).
     let cluster = cluster_for_caip2_network(&requirement.network)?;
-    let network = normalize_network(cluster);
+    let network = cluster_slug(cluster);
     let mint = resolve_mint(&requirement.asset, &network)?;
     let amount = requirement.amount.parse::<u64>().ok()?;
     Some(Candidate {
@@ -545,17 +546,11 @@ fn resolve_mint(currency: &str, network: &str) -> Option<String> {
         .or_else(|| Some(currency.to_string()))
 }
 
-/// Collapse the various network spellings to a canonical slug.
-fn normalize_network(raw: &str) -> String {
-    let n = raw.trim().to_ascii_lowercase();
-    if n.contains("devnet") {
-        "devnet".to_string()
-    } else if n.contains("testnet") {
-        "testnet".to_string()
-    } else if n.contains("localnet") || n.contains("local") {
-        "localnet".to_string()
-    } else {
-        "mainnet".to_string()
+/// Network slug for a cluster returned by `cluster_for_caip2_network`.
+fn cluster_slug(cluster: &str) -> String {
+    match cluster {
+        "mainnet-beta" => "mainnet".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -849,5 +844,211 @@ mod tests {
             .expect("the USDG upto accept should be fundable");
         assert_eq!(selected.protocol(), "x402-upto");
         assert_eq!(selected.mint(), mints::USDG_MAINNET);
+    }
+
+    /// An `upto` offer missing its channel metadata: the typed `upto` parser
+    /// drops it, the generic x402 parser keeps it.
+    fn malformed_upto_body(ceiling: u64) -> String {
+        serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "upto",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": ceiling.to_string(),
+                "asset": mints::USDC_MAINNET,
+                "payTo": RECIPIENT,
+                "maxTimeoutSeconds": 300,
+                "extra": { "recentBlockhash": RECIPIENT, "memo": "malformed-upto" },
+            }],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn malformed_upto_offer_is_never_selected_as_exact() {
+        let body = malformed_upto_body(1_000_000);
+        assert!(parse_upto_accepts(&[], Some(&body)).is_empty());
+        assert_eq!(parse_x402_accepts(&[], Some(&body)).len(), 1);
+
+        let funded = vec![token(mints::USDC_MAINNET, 1_000_000)];
+        let err = select_payment(
+            &[],
+            Some(&body),
+            &funded,
+            &OrderingStrategy::CheapestPayable,
+        )
+        .expect_err("a non-exact offer must not become an exact candidate");
+        assert!(err.offered.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn valid_upto_offer_is_selected_only_as_upto() {
+        let body = upto_body("USDC", 1000);
+        let funded = vec![token(mints::USDC_MAINNET, 1_000_000)];
+        for order in [
+            OrderingStrategy::HighestBalance,
+            OrderingStrategy::CheapestPayable,
+            OrderingStrategy::MppFirst,
+        ] {
+            let selected = select_payment(&[], Some(&body), &funded, &order).unwrap();
+            assert!(
+                matches!(selected, SelectedPayment::X402Upto { .. }),
+                "{selected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_offer_with_explicit_scheme_is_still_selected() {
+        let body = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": mints::USDC_MAINNET,
+                "payTo": RECIPIENT,
+                "maxTimeoutSeconds": 300,
+                "extra": { "decimals": 6 },
+            }],
+        })
+        .to_string();
+        let funded = vec![token(mints::USDC_MAINNET, 1_000_000)];
+        let selected =
+            select_payment(&[], Some(&body), &funded, &OrderingStrategy::HighestBalance).unwrap();
+        assert!(matches!(selected, SelectedPayment::X402Exact { .. }));
+    }
+
+    #[test]
+    fn native_sol_offers_are_not_payment_candidates() {
+        let headers = vec![mpp_charge("SOL", 1_000_000_000)];
+        let body = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000000000",
+                "asset": "SOL",
+                "payTo": RECIPIENT,
+                "maxTimeoutSeconds": 300,
+            }],
+        })
+        .to_string();
+        // Even a wallet that lists a "SOL" token cannot be matched to these.
+        let funded = vec![token("SOL", u64::MAX), token(mints::USDC_MAINNET, u64::MAX)];
+        let err = select_payment(&headers, Some(&body), &funded, &OrderingStrategy::MppFirst)
+            .expect_err("native SOL must not be selected");
+        assert!(err.offered.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn unknown_x402_network_is_not_a_mainnet_candidate() {
+        let offer = |network: &str, cluster: Option<&str>| {
+            let mut accept = serde_json::json!({
+                "scheme": "exact",
+                "network": network,
+                "amount": "1000",
+                "asset": mints::USDC_MAINNET,
+                "payTo": RECIPIENT,
+                "maxTimeoutSeconds": 300,
+            });
+            if let Some(cluster) = cluster {
+                accept["cluster"] = serde_json::json!(cluster);
+            }
+            serde_json::json!({ "x402Version": 2, "accepts": [accept] }).to_string()
+        };
+        let funded = vec![token(mints::USDC_MAINNET, 1_000_000)];
+        for body in [
+            offer("solana:custom-cluster-id", None),
+            offer("solana:custom-cluster-id", Some("mainnet-beta")),
+            offer("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", Some("devnet")),
+        ] {
+            let err = select_payment(&[], Some(&body), &funded, &OrderingStrategy::HighestBalance)
+                .expect_err("unknown or conflicting network must not be fundable");
+            assert!(err.offered.is_empty(), "{body}: {err}");
+        }
+        assert!(select_payment(
+            &[],
+            Some(&offer("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", None)),
+            &funded,
+            &OrderingStrategy::HighestBalance
+        )
+        .is_ok());
+    }
+
+    fn mpp_charge_on(network: Option<&str>) -> (String, String) {
+        let mut details = serde_json::json!({});
+        if let Some(network) = network {
+            details["network"] = serde_json::json!(network);
+        }
+        let request = serde_json::json!({
+            "amount": "1000",
+            "currency": "USDC",
+            "recipient": RECIPIENT,
+            "methodDetails": details,
+        });
+        let challenge = PaymentChallenge::new(
+            "id-1",
+            "realm",
+            "solana",
+            "charge",
+            Base64UrlJson::from_value(&request).unwrap(),
+        );
+        (
+            "www-authenticate".to_string(),
+            format_www_authenticate(&challenge).unwrap(),
+        )
+    }
+
+    #[test]
+    fn unsupported_mpp_network_is_not_a_mainnet_candidate() {
+        let funded = vec![
+            token(mints::USDC_MAINNET, 1_000_000),
+            AcceptableToken {
+                mint: mints::USDC_DEVNET.to_string(),
+                network: "devnet".to_string(),
+                available: 1_000_000,
+            },
+        ];
+        for network in [
+            "attacker-chain",
+            "Mainnet",
+            "mainnet ",
+            "testnet",
+            "devnet-fork",
+            "solana:mainnet",
+            "",
+        ] {
+            let err = select_payment(
+                &[mpp_charge_on(Some(network))],
+                None,
+                &funded,
+                &OrderingStrategy::MppFirst,
+            )
+            .expect_err("an unsupported MPP network must not be fundable");
+            assert!(err.offered.is_empty(), "{network:?}: {err}");
+        }
+
+        for (network, expected) in [
+            (None, "mainnet"),
+            (Some("mainnet"), "mainnet"),
+            (Some("mainnet-beta"), "mainnet"),
+            (Some("devnet"), "devnet"),
+        ] {
+            let selected = select_payment(
+                &[mpp_charge_on(network)],
+                None,
+                &funded,
+                &OrderingStrategy::MppFirst,
+            )
+            .unwrap();
+            let SelectedPayment::MppCharge {
+                network: selected, ..
+            } = selected
+            else {
+                panic!("expected an MPP charge");
+            };
+            assert_eq!(selected, expected, "{network:?}");
+        }
     }
 }

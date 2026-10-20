@@ -132,6 +132,7 @@ async fn sol_charge_full_flow() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -140,6 +141,9 @@ async fn sol_charge_full_flow() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -191,6 +195,7 @@ async fn sol_charge_wrong_amount_rejected_before_broadcast() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -199,6 +204,9 @@ async fn sol_charge_wrong_amount_rejected_before_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -279,6 +287,7 @@ async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: real_recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -287,6 +296,9 @@ async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -358,6 +370,7 @@ async fn sol_charge_identical_retry_is_rejected() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -366,6 +379,9 @@ async fn sol_charge_identical_retry_is_rejected() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -426,6 +442,7 @@ async fn sol_charge_expired_challenge_rejected() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -434,6 +451,9 @@ async fn sol_charge_expired_challenge_rejected() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -457,8 +477,7 @@ async fn sol_charge_expired_challenge_rejected() {
     // challenges; server-side rejection is the defense-in-depth backstop.
     let err = build_credential_header(&*signer, &rpc, &challenge)
         .await
-        .err()
-        .expect("expired challenge should be rejected before signing");
+        .expect_err("expired challenge should be rejected before signing");
     assert!(
         err.to_string().contains("expired"),
         "Expected expired rejection, got: {err}"
@@ -478,6 +497,7 @@ async fn sol_charge_www_authenticate_roundtrip() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -486,6 +506,9 @@ async fn sol_charge_www_authenticate_roundtrip() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -554,6 +577,7 @@ async fn usdc_charge_full_flow() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "USDC".to_string(),
         decimals: 6,
@@ -562,6 +586,9 @@ async fn usdc_charge_full_flow() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -647,6 +674,7 @@ async fn usdc_charge_wrong_amount_no_broadcast() {
         .unwrap();
 
     let mpp = Mpp::new(Config {
+        realm: Some("test-realm".to_string()),
         recipient: recipient.pubkey().to_string(),
         currency: "USDC".to_string(),
         decimals: 6,
@@ -655,6 +683,9 @@ async fn usdc_charge_wrong_amount_no_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        store: Some(std::sync::Arc::new(
+            solana_pay_kit::mpp::store::MemoryStore::new(),
+        )),
         ..Default::default()
     })
     .unwrap();

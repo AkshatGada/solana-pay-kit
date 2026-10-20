@@ -140,6 +140,7 @@ mod tests {
             program_id: None,
             challenge_binding_secret: "test-secret".into(),
             realm: "api.example.com".into(),
+            subscription_expires: None,
             statement: None,
             store: None,
         })
@@ -189,12 +190,14 @@ mod tests {
         // Build a charge challenge instead of authenticate — should fail
         // at the intent check before any signing happens.
         let challenge = crate::mpp::server::Mpp::new(crate::mpp::server::Config {
+            realm: Some("test-realm".to_string()),
             recipient: signer.pubkey().to_string(),
             currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             decimals: 6,
             network: "mainnet".into(),
             // ≥32 bytes to satisfy the audit #24 secret-length check at Mpp::new.
             challenge_binding_secret: Some("test-secret-key-for-authenticate-32b-pad".into()),
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .expect("mpp")

@@ -20,7 +20,7 @@ only when ``expires_at != 0 && now >= expires_at``, so ``expires_at == 0`` means
 one extra guard: because settlement is asynchronous (the server may co-sign and
 broadcast the close up to the channel's forced-close grace period later), a
 non-zero ``expires_at`` must also OUTLAST the settlement window — we reject when
-``expires_at < now + settlement_window`` so a voucher cannot expire on-chain
+``expires_at <= now + settlement_window`` so a voucher cannot expire on-chain
 after the server has already served the request but before the settle lands.
 """
 
@@ -60,6 +60,9 @@ class VoucherRejectReason(StrEnum):
 
     #: The channel is already sealed.
     CHANNEL_SEALED = "channel-sealed"
+
+    #: The voucher is bound to another channel.
+    CHANNEL_MISMATCH = "channel-mismatch"
 
     #: The cumulative does not strictly exceed the watermark.
     CUMULATIVE_NOT_MONOTONIC = "cumulative-not-monotonic"
@@ -190,6 +193,12 @@ def verify_voucher_for_channel(args: VerifyVoucherArgs) -> VoucherVerifyResult:
     state = args.state
     signed = args.signed
 
+    if signed.data.channel_id != state.channel_id:
+        return _voucher_reject(
+            VoucherRejectReason.CHANNEL_MISMATCH,
+            f"voucher channelId {signed.data.channel_id} does not match channel {state.channel_id}",
+        )
+
     # 1. Parse new cumulative from the payload.
     try:
         new_cumulative = _parse_u64(signed.data.cumulative_amount)
@@ -303,7 +312,7 @@ def _check_voucher_expiry(expires_at: int | None, now: int, settlement_window: i
     - ``expires_at == 0`` is **never-expires** and is always accepted (the
       on-chain settle only rejects ``expires_at != 0 && now >= expires_at``).
     - A non-zero ``expires_at <= now`` is already expired -> ``EXPIRED``.
-    - A non-zero ``expires_at`` that is in the future but does not outlast
+    - A non-zero ``expires_at`` that is in the future but is not strictly after
       ``now + settlement_window`` could expire on-chain before the asynchronous
       close settlement lands -> ``EXPIRES_BEFORE_SETTLEMENT``. ``settlement_window``
       of 0 disables this guard.
@@ -313,7 +322,7 @@ def _check_voucher_expiry(expires_at: int | None, now: int, settlement_window: i
         return None
     if expires_at <= now:
         return _voucher_reject(VoucherRejectReason.EXPIRED, "voucher has expired")
-    if settlement_window > 0 and expires_at < now + settlement_window:
+    if settlement_window > 0 and expires_at <= now + settlement_window:
         return _voucher_reject(
             VoucherRejectReason.EXPIRES_BEFORE_SETTLEMENT,
             f"voucher expires_at {expires_at} does not outlast the settlement window "

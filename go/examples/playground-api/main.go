@@ -19,8 +19,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	solana "github.com/gagliardetto/solana-go"
@@ -31,6 +33,7 @@ import (
 	"github.com/solana-foundation/pay-kit/go/paykit"
 	_ "github.com/solana-foundation/pay-kit/go/paykit/adapters/mpp"
 	_ "github.com/solana-foundation/pay-kit/go/paykit/adapters/x402"
+	core "github.com/solana-foundation/pay-kit/go/protocols/mpp/core"
 )
 
 // app carries the boot configuration shared by every module.
@@ -53,6 +56,8 @@ type app struct {
 	// repoRoot is the repository checkout root; "" outside a checkout, which
 	// disables the docs browser default root and the SPA file server.
 	repoRoot string
+	// replayStore is the MPP replay store shared by every charge verifier.
+	replayStore core.Store
 }
 
 func main() {
@@ -93,6 +98,8 @@ func main() {
 		feePayer:  feePayer,
 		rpcClient: rpc.New(rpcURL),
 		repoRoot:  findRepoRoot(),
+
+		replayStore: core.NewMemoryStore(),
 	}
 
 	bootstrapFunding(a)
@@ -201,6 +208,7 @@ func newPaymentClient(a *app, accept []paykit.Protocol, x402Scheme string) (*pay
 		MPP: paykit.MPPConfig{
 			Realm:                  "PayKit Playground",
 			ChallengeBindingSecret: []byte(a.secretKey),
+			Store:                  a.replayStore,
 		},
 		X402: paykit.X402Config{
 			Scheme: x402Scheme,
@@ -396,15 +404,16 @@ func registerSPA(mux *http.ServeMux, repoRoot string) {
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if dist != "" {
-			candidate := filepath.Join(dist, filepath.FromSlash(r.URL.Path))
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				http.ServeFile(w, r, candidate)
-				return
-			}
-			index := filepath.Join(dist, "index.html")
-			if _, err := os.Stat(index); err == nil {
-				http.ServeFile(w, r, index)
-				return
+			if root, err := os.OpenRoot(dist); err == nil {
+				defer func() { _ = root.Close() }()
+				name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+				if info, err := root.Stat(name); err != nil || info.IsDir() {
+					name = "index.html"
+				}
+				if _, err := root.Stat(name); err == nil {
+					http.ServeFileFS(w, r, root.FS(), name)
+					return
+				}
 			}
 		}
 		writeJSONError(w, http.StatusNotFound,

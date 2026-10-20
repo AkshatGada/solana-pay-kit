@@ -156,6 +156,7 @@ async fn main() {
     // No fee payer — test mode client pays its own fees.
     let mpp = Arc::new(
         Mpp::new(Config {
+            realm: Some("payment-link-example".to_string()),
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             challenge_binding_secret: Some(
                 "e2e-test-secret-key-long-enough-for-hmac-operations-1234567890".into(),
@@ -165,6 +166,9 @@ async fn main() {
             currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             decimals: 6,
             html: true,
+            store: Some(std::sync::Arc::new(
+                solana_pay_kit::mpp::store::MemoryStore::new(),
+            )),
             ..Default::default()
         })
         .expect("valid config"),

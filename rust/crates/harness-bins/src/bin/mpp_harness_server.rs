@@ -167,7 +167,11 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             // bundle settlement (which needs the recipient ElGamal key) is not
             // exercised here, so leave it unset.
             recipient_signer: None,
-            store: None,
+            confidential_auditor: None,
+            accept_unverified_confidential_amount: false,
+            store: Some(std::sync::Arc::new(
+                solana_pay_kit::mpp::store::MemoryStore::new(),
+            )),
             html: false,
             // Interop tests exercise push mode end-to-end; the gate is
             // opt-in (audit #5) so we set it explicitly here.

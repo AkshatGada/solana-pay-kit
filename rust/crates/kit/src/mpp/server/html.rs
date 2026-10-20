@@ -252,12 +252,14 @@ mod tests {
     #[test]
     fn test_html_enabled_on_mpp() {
         let mpp = crate::mpp::server::Mpp::new(crate::mpp::server::Config {
+            realm: Some("test-realm".to_string()),
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             challenge_binding_secret: Some(
                 "test-secret-key-long-enough-for-hmac-sha256-operations-1234567890".to_string(),
             ),
             network: "localnet".to_string(),
             html: true,
+            store: Some(std::sync::Arc::new(crate::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap();
