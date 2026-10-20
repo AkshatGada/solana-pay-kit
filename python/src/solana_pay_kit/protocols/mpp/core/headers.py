@@ -32,7 +32,7 @@ class ParseError(Exception):
 # Matches the canonical mpp-tools receipt timestamp validation; rejects loose
 # forms like "Jan 29 2026 12:00".
 _ISO8601_RE = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:"
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?P<hour>[0-9]{2}):[0-9]{2}:"
     r"(?P<second>[0-9]{2})(?:\.[0-9]+)?(?P<offset>Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 
@@ -41,6 +41,10 @@ def _validate_receipt_timestamp(value: str) -> None:
     match = _ISO8601_RE.fullmatch(value)
     if match is None:
         raise ValueError("invalid receipt timestamp format")
+    # Python 3.14 normalizes ISO-8601's 24:00 to the next day; RFC 3339
+    # requires an hour in 00..23 regardless of the host parser's behavior.
+    if int(match.group("hour")) > 23:
+        raise ValueError("timestamp hour out of range")
     offset = match.group("offset")
     if offset != "Z" and (int(offset[1:3]) > 23 or int(offset[4:6]) > 59):
         raise ValueError("timestamp offset out of range")
