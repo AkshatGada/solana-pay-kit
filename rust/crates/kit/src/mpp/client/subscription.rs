@@ -12,6 +12,7 @@
 use std::str::FromStr;
 
 use crate::core::tx::TxVersion;
+use solana_commitment_config::CommitmentConfig;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keychain::{SolanaSigner, TransactionSigner};
 use solana_pubkey::Pubkey;
@@ -316,18 +317,25 @@ pub async fn build_subscription_activation_transaction_with_options(
     // missing, broadcast a one-off init tx as the subscriber, paid by the
     // subscriber (~0.002 SOL rent + ~5k lamports fee).
     // A supplied blockhash avoids an RPC roundtrip; only absence triggers
-    // the fallback, so malformed server values remain errors. Match the
-    // client's commitment so authority initialization uses the same preflight.
+    // the fallback, so malformed server values remain errors. The activation
+    // server uses confirmed preflight, so fetch at least confirmed while
+    // preserving a caller's stricter finalized commitment.
     let blockhash: solana_hash::Hash = match method_details.recent_blockhash.as_deref() {
         Some(value) => value
             .parse()
             .map_err(|e| Error::Other(format!("Invalid recentBlockhash: {e}")))?,
-        None => rpc
-            .get_inner_client()
-            .get_latest_blockhash_with_commitment(rpc.commitment())
-            .await
-            .map(|(hash, _last_valid_block_height)| hash)
-            .map_err(|e| Error::Rpc(e.to_string()))?,
+        None => {
+            let commitment = if rpc.commitment().is_processed() {
+                CommitmentConfig::confirmed()
+            } else {
+                rpc.commitment()
+            };
+            rpc.get_inner_client()
+                .get_latest_blockhash_with_commitment(commitment)
+                .await
+                .map(|(hash, _last_valid_block_height)| hash)
+                .map_err(|e| Error::Rpc(e.to_string()))?
+        }
     };
 
     let expected_subscription_authority_init_id = match options.subscription_authority_init_id {
@@ -804,12 +812,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_recent_blockhash_uses_client_commitment_on_current_thread() {
+    async fn missing_recent_blockhash_uses_at_least_confirmed_on_current_thread() {
         let signer = make_signer();
         let fetched = Hash::new_from_array([9; 32]);
         let mut md = make_method_details(false, None);
         md.recent_blockhash = None;
-        for commitment in [CommitmentConfig::default(), CommitmentConfig::confirmed()] {
+        for (commitment, expected) in [
+            (CommitmentConfig::processed(), CommitmentConfig::confirmed()),
+            (CommitmentConfig::confirmed(), CommitmentConfig::confirmed()),
+            (CommitmentConfig::finalized(), CommitmentConfig::finalized()),
+        ] {
             let (rpc, requests) = blockhash_rpc(Some(fetched), commitment);
             let payload = build_subscription_activation_transaction_with_options(
                 &*signer,
@@ -826,7 +838,7 @@ mod tests {
             assert_eq!(*tx.message.recent_blockhash(), fetched);
             assert_eq!(
                 *requests.lock().unwrap(),
-                vec![("getLatestBlockhash".into(), serde_json::json!([commitment]))]
+                vec![("getLatestBlockhash".into(), serde_json::json!([expected]))]
             );
         }
     }
@@ -853,6 +865,7 @@ mod tests {
 
     struct AuthorityInitRpc {
         blockhash: Hash,
+        preflight_commitment: CommitmentConfig,
         account_reads: AtomicUsize,
         requests: RpcRequests,
     }
@@ -898,11 +911,12 @@ mod tests {
                     }
                 }
                 RpcRequest::SendTransaction => {
-                    // A fresh hash from a confirmed bank may not exist in a
-                    // finalized preflight bank. Require the policies to agree.
-                    let fetched_commitment =
-                        self.requests.lock().unwrap()[0].1[0]["commitment"].clone();
-                    assert_eq!(params[1]["preflightCommitment"], fetched_commitment);
+                    // Initialization preserves the caller's preflight policy;
+                    // a confirmed hash is also known to a processed bank.
+                    assert_eq!(
+                        params[1]["preflightCommitment"],
+                        serde_json::json!(self.preflight_commitment.commitment)
+                    );
                     let tx = crate::core::tx::decode(params[0].as_str().unwrap()).unwrap();
                     assert_eq!(*tx.message.recent_blockhash(), self.blockhash);
                     tx.verify_and_hash_message().unwrap();
@@ -934,11 +948,16 @@ mod tests {
         let fetched = Hash::new_from_array([9; 32]);
         let mut md = make_method_details(false, None);
         md.recent_blockhash = None;
-        for commitment in [CommitmentConfig::default(), CommitmentConfig::confirmed()] {
+        for (commitment, expected) in [
+            (CommitmentConfig::processed(), CommitmentConfig::confirmed()),
+            (CommitmentConfig::confirmed(), CommitmentConfig::confirmed()),
+            (CommitmentConfig::finalized(), CommitmentConfig::finalized()),
+        ] {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let rpc = RpcClient::new_sender(
                 AuthorityInitRpc {
                     blockhash: fetched,
+                    preflight_commitment: commitment,
                     account_reads: AtomicUsize::new(0),
                     requests: Arc::clone(&requests),
                 },
@@ -977,7 +996,7 @@ mod tests {
                 77
             );
             let requests = requests.lock().unwrap();
-            assert_eq!(requests[0].1, serde_json::json!([commitment]));
+            assert_eq!(requests[0].1, serde_json::json!([expected]));
             assert_eq!(
                 requests
                     .iter()
