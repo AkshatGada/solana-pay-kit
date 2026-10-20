@@ -1,0 +1,12 @@
+{
+  "base_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "fix_commit": "525f2ad31db0d689d0d96a776ba4964761ac2200",
+  "recorded_utc": "2026-10-20T13:38:34.907426+00:00",
+  "source_sha256": {
+    "go/protocols/mpp/server/session_onchain.go": "38845bf662fc59a3010f9d35648267a2df39f200872fbfb131e0fd45d1515ceb",
+    "go/protocols/mpp/server/session_method_branch_test.go": "1336e325c73f433553c1142eb662df2d62d8bbcdafc9004c64e0a4ed882d473c",
+    "go/protocols/mpp/server/session_cosigning_policy_test.go": "66a4c74f8669b8976f18a64859fcbeb0174ff1457c8e4a515e166b865c7105fe"
+  },
+  "network": "offline tests; no payments or live blockchain calls",
+  "test_counts_include_subtests": true
+}

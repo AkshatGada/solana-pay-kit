@@ -1,0 +1,20 @@
+{
+  "historical_before": {
+    "recorded": "2026-10-19",
+    "cases": 12,
+    "signer_callback_calls_per_case": 1,
+    "rpc_send_attempts": 0,
+    "source": "historical-before-2026-10-19.jsonl",
+    "provenance_limit": "Historical capture retained as recorded; not regenerated in this backup run."
+  },
+  "fresh_fixed": {
+    "cases": 12,
+    "signer_callback_calls_per_case": 0,
+    "rpc_send_attempts": 0,
+    "tests_pass": 1612,
+    "tests_skip": 14,
+    "race_pass": 576,
+    "race_skip": 2
+  },
+  "valid_control": "Canonical opens and capped budgets reach the intentionally refusing signer; valid signed price-cap controls use only in-memory FakeRPC."
+}
