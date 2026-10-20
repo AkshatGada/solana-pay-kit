@@ -1,0 +1,14 @@
+{"case": "impossible calendar date", "timestamp": "2026-02-30T00:00:00Z", "valid_control": false, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "impossible calendar date", "timestamp": "2026-02-30T00:00:00Z", "valid_control": false, "variant": "fixed", "outcome": "rejected", "error": "Invalid ISO-8601 timestamp in receipt: '2026-02-30T00:00:00Z'"}
+{"case": "invalid clock hour", "timestamp": "2026-01-01T24:00:00Z", "valid_control": false, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "invalid clock hour", "timestamp": "2026-01-01T24:00:00Z", "valid_control": false, "variant": "fixed", "outcome": "rejected", "error": "Invalid ISO-8601 timestamp in receipt: '2026-01-01T24:00:00Z'"}
+{"case": "invalid offset minute", "timestamp": "2026-01-01T00:00:00+00:60", "valid_control": false, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "invalid offset minute", "timestamp": "2026-01-01T00:00:00+00:60", "valid_control": false, "variant": "fixed", "outcome": "rejected", "error": "Invalid ISO-8601 timestamp in receipt: '2026-01-01T00:00:00+00:60'"}
+{"case": "trailing newline", "timestamp": "2026-01-01T00:00:00Z\n", "valid_control": false, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "trailing newline", "timestamp": "2026-01-01T00:00:00Z\n", "valid_control": false, "variant": "fixed", "outcome": "rejected", "error": "Invalid ISO-8601 timestamp in receipt: '2026-01-01T00:00:00Z\\n'"}
+{"case": "valid leap day", "timestamp": "2024-02-29T12:30:00Z", "valid_control": true, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "valid leap day", "timestamp": "2024-02-29T12:30:00Z", "valid_control": true, "variant": "fixed", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "precise fractional seconds", "timestamp": "2026-01-01T00:00:00.123456789Z", "valid_control": true, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "precise fractional seconds", "timestamp": "2026-01-01T00:00:00.123456789Z", "valid_control": true, "variant": "fixed", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "valid offset leap second", "timestamp": "1999-01-01T00:59:60+01:00", "valid_control": true, "variant": "baseline", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}
+{"case": "valid offset leap second", "timestamp": "1999-01-01T00:59:60+01:00", "valid_control": true, "variant": "fixed", "outcome": "accepted", "exact_wire_value": true, "roundtrip_preserves_wire": true}

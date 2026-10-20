@@ -1,0 +1,11 @@
+{
+  "base_commit": "bd3ad25baeb65c1c293239e1b4990f14d26a22ad",
+  "fix_commit": "538a1984490ef7b7ce8cb0cc9d58cc683a66426d",
+  "recorded_utc": "2026-10-20T13:38:34.893549+00:00",
+  "source_sha256": {
+    "python/src/solana_pay_kit/protocols/mpp/core/headers.py": "741c7b466374640b500a7813e47d98bf9c0ad85527be08554354f89f42a10f4c",
+    "python/tests/test_headers.py": "f31ec418dad260403b1bc632d3a676f0a5c9bf1544b9f3c823f8830b00d42c21"
+  },
+  "network": "offline tests; no payments or live blockchain calls",
+  "test_counts_include_subtests": false
+}

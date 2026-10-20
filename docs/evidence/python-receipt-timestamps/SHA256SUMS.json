@@ -1,0 +1,12 @@
+{
+  "PR-DRAFT.md": "f717d0b2339710e975dbb754c5acbca0315b674dba0f2c95691a53f8fa7fd684",
+  "README.md": "919f93c43b83f1f493c9f3e7f9041467b9b7629b953254aca16b63a62b2553ce",
+  "comparison.jsonl": "9f183fec987c46b000c7c2bf20225d852ed3afa03bb2a52032ad86356469b724",
+  "coverage-summary.json": "6673d60b5549da4ee610ec93306bfc7d3db5512d2038ad81d9d5a9f1acda20d3",
+  "provenance.json": "537cfdf21daef8261ff3da5a588fb57819bfe9a9dba98779724454f2db392e29",
+  "receipt_demo.py": "0aae1b834990a335bf8fbb867f057316d961bae58a1f22eb6473496f1f7bc9bd",
+  "report.html": "a339657acfe6d8dd00737b0601e7c8a4c2acab756b7ef8fa8d998add70ca15cb",
+  "summary.png": "39ef6e3c93d05312b3594cf4b8a0d4ebc5c1bc0198ed4290e155c5b8b5f62302",
+  "tests.log": "58ccd228e962012ce6f3a98149fad08efd6c561cbc04464efaf38b2962471416",
+  "verify_evidence.py": "258e40f3458f806c3957710141f02db8a3c40755d5e12695de038e6ae167c426"
+}

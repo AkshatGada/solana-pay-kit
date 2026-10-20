@@ -1,0 +1,129 @@
+........................................................................ [  5%]
+........................................................................ [ 10%]
+........................................................................ [ 15%]
+........................................................................ [ 20%]
+........................................................................ [ 25%]
+........................................................................ [ 30%]
+........................................................................ [ 35%]
+........................................................................ [ 40%]
+........................................................................ [ 45%]
+........................................................................ [ 50%]
+........................................................................ [ 55%]
+........................................................................ [ 60%]
+........................................................................ [ 66%]
+........................................................................ [ 71%]
+........................................................................ [ 76%]
+.................................s...................................... [ 81%]
+........................................................................ [ 86%]
+........................................................................ [ 91%]
+........................................................................ [ 96%]
+.................................................                        [100%]
+=============================== warnings summary ===============================
+src/solana_pay_kit/operator.py:63
+  /Users/akshatgada/solana-pay-kit/python/src/solana_pay_kit/operator.py:63: UserWarning: solana_pay_kit: using the shipped demo signer (ALtYSsZuYyKrNSe6GnVCzxj1T2RPMTPzXMe51xhbmXEq); never use it on solana_mainnet
+    signer = self.signer if self.signer is not None else Signer.demo()
+
+tests/test_pk_signer_operator.py::test_operator_defaults_and_explicit_recipient
+tests/test_pk_x402_settle.py::test_no_operator_signer_rejected
+  /Users/akshatgada/solana-pay-kit/python/src/solana_pay_kit/operator.py:55: UserWarning: solana_pay_kit: using the shipped demo signer (ALtYSsZuYyKrNSe6GnVCzxj1T2RPMTPzXMe51xhbmXEq); never use it on solana_mainnet
+    signer = self.signer if self.signer is not None else Signer.demo()
+
+tests/test_pk_signer_operator.py::test_operator_equality_and_hash_use_resolved_identity
+  /Users/akshatgada/solana-pay-kit/python/src/solana_pay_kit/operator.py:81: UserWarning: solana_pay_kit: using the shipped demo signer (ALtYSsZuYyKrNSe6GnVCzxj1T2RPMTPzXMe51xhbmXEq); never use it on solana_mainnet
+    signer = self.signer if self.signer is not None else Signer.demo()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================ tests coverage ================================
+______________ coverage: platform darwin, python 3.12.14-final-0 _______________
+
+Name                                                           Stmts   Miss  Cover   Missing
+--------------------------------------------------------------------------------------------
+src/solana_pay_kit/__init__.py                                    28      1    96%   141
+src/solana_pay_kit/_middleware.py                                184      7    96%   102, 198-201, 346, 389
+src/solana_pay_kit/_paycore/__init__.py                            6      0   100%
+src/solana_pay_kit/_paycore/currency.py                           38      3    92%   57, 79-80
+src/solana_pay_kit/_paycore/errors.py                             36      0   100%
+src/solana_pay_kit/_paycore/mints.py                              24      1    96%   67
+src/solana_pay_kit/_paycore/network.py                            20      0   100%
+src/solana_pay_kit/_paycore/network_check.py                      13      0   100%
+src/solana_pay_kit/_paycore/paymentchannels.py                   169      0   100%
+src/solana_pay_kit/_paycore/protocol.py                            6      0   100%
+src/solana_pay_kit/_paycore/rpc.py                               102     14    86%   160-174
+src/solana_pay_kit/_paycore/solana.py                            184     21    89%   145-150, 162-182, 275, 364, 366
+src/solana_pay_kit/_paycore/stablecoin.py                          9      0   100%
+src/solana_pay_kit/_paycore/store.py                              85      6    93%   97, 140-145, 177
+src/solana_pay_kit/_paycore/transaction.py                        46      1    98%   37
+src/solana_pay_kit/client/__init__.py                              3      0   100%
+src/solana_pay_kit/client/client.py                              168     57    66%   67, 86, 90, 130-133, 153, 160, 165, 169, 173, 177, 181, 184, 187, 194-201, 205-206, 210-211, 215-216, 220-221, 225-229, 233-234, 238-239, 243-244, 248-266, 271, 278-282, 291
+src/solana_pay_kit/client/permissions.py                         199     25    87%   91, 97, 130-131, 188, 203, 205, 208-209, 225, 264-265, 269-270, 274-275, 284-285, 316, 323, 326-327, 330, 341-342
+src/solana_pay_kit/config.py                                     316     12    96%   175, 177, 196, 198, 206, 208, 285, 323, 333, 335, 574, 576
+src/solana_pay_kit/django.py                                     159     52    67%   83, 156-181, 227-228, 238-240, 255-257, 308-309, 323-333, 353-370
+src/solana_pay_kit/errors.py                                      26      0   100%
+src/solana_pay_kit/fastapi.py                                    254     41    84%   92, 201-202, 237-238, 277-286, 305-306, 336, 352, 409, 513-523, 527-538, 555, 590, 603, 609, 619
+src/solana_pay_kit/fee.py                                         21      0   100%
+src/solana_pay_kit/flask.py                                      139     40    71%   62, 145-171, 190-191, 208, 214, 236, 254-255, 269-277, 289-293
+src/solana_pay_kit/gate.py                                       124      0   100%
+src/solana_pay_kit/kms.py                                         13      0   100%
+src/solana_pay_kit/operator.py                                    43      1    98%   36
+src/solana_pay_kit/payment.py                                     11      0   100%
+src/solana_pay_kit/price.py                                       63      4    94%   50-53, 72
+src/solana_pay_kit/pricing.py                                     48      2    96%   120-122
+src/solana_pay_kit/protocols/__init__.py                           3      0   100%
+src/solana_pay_kit/protocols/mpp/__init__.py                     199      7    96%   147, 159, 275-279, 383, 417, 424
+src/solana_pay_kit/protocols/mpp/_paymentchannels.py               3      0   100%
+src/solana_pay_kit/protocols/mpp/client/__init__.py                7      0   100%
+src/solana_pay_kit/protocols/mpp/client/charge.py                137      5    96%   81-82, 203, 205, 413
+src/solana_pay_kit/protocols/mpp/client/http_stream.py           216      4    98%   96, 300, 346-348
+src/solana_pay_kit/protocols/mpp/client/payment_channels.py      164     13    92%   269, 284, 288, 295, 377-378, 470-471, 505-506, 513-514, 519
+src/solana_pay_kit/protocols/mpp/client/session.py                98      8    92%   110, 120, 181, 186-187, 221-222, 307
+src/solana_pay_kit/protocols/mpp/client/session_consumer.py       56      0   100%
+src/solana_pay_kit/protocols/mpp/client/transport.py              34      0   100%
+src/solana_pay_kit/protocols/mpp/core/__init__.py                  1      0   100%
+src/solana_pay_kit/protocols/mpp/core/base64url.py                15      0   100%
+src/solana_pay_kit/protocols/mpp/core/challenge.py                10      0   100%
+src/solana_pay_kit/protocols/mpp/core/expires.py                  14      0   100%
+src/solana_pay_kit/protocols/mpp/core/headers.py                 272     18    93%   146, 182, 185, 254, 266, 295, 334, 371-373, 375-377, 436, 444-446, 452
+src/solana_pay_kit/protocols/mpp/core/json.py                    109      7    94%   53, 56, 67, 166, 183, 185, 192
+src/solana_pay_kit/protocols/mpp/core/types.py                    84      0   100%
+src/solana_pay_kit/protocols/mpp/intents/__init__.py               4      0   100%
+src/solana_pay_kit/protocols/mpp/intents/charge.py                38      2    95%   35, 37
+src/solana_pay_kit/protocols/mpp/intents/session.py              441     39    91%   79, 128, 165, 169, 171, 182, 187, 192, 270, 369-370, 408-409, 427, 429, 433, 443, 524-525, 528-529, 577, 623, 769, 771, 783, 836, 838, 874-875, 898, 902, 926-929, 935-936, 954
+src/solana_pay_kit/protocols/mpp/server/__init__.py               10      0   100%
+src/solana_pay_kit/protocols/mpp/server/_tx_decode.py            217     21    90%   84, 202-203, 228, 249, 416, 428-429, 433, 436, 439-440, 458, 461, 465-466, 488-492
+src/solana_pay_kit/protocols/mpp/server/_verify.py               203     28    86%   255-256, 305, 314, 361-362, 377-390, 393, 400, 405, 411, 418-419, 453, 458, 463, 472-473, 478, 497, 519
+src/solana_pay_kit/protocols/mpp/server/charge.py                248     19    92%   220-221, 292, 386, 391, 518, 520, 531-534, 546, 561-562, 588, 611, 631, 646, 683
+src/solana_pay_kit/protocols/mpp/server/defaults.py               15      0   100%
+src/solana_pay_kit/protocols/mpp/server/html/__init__.py           1      0   100%
+src/solana_pay_kit/protocols/mpp/server/middleware.py             38      1    97%   59
+src/solana_pay_kit/protocols/mpp/server/payment_page.py           66      7    89%   57-58, 72-73, 114, 123-124
+src/solana_pay_kit/protocols/mpp/server/session.py               544     74    86%   253, 256, 265, 268, 421, 432, 441, 443-447, 460-461, 489, 535, 546-547, 552, 560, 564, 566, 620-632, 659, 669, 671, 690, 749, 780, 782, 784, 788, 797, 822-823, 856, 860, 862, 896, 898, 911-912, 955-956, 960, 972, 980, 993, 995, 997, 1000-1005, 1012, 1015, 1017, 1074, 1076, 1098, 1102-1104, 1106, 1108, 1111, 1119-1120, 1148, 1200
+src/solana_pay_kit/protocols/mpp/server/session_lifecycle.py      41      1    98%   95
+src/solana_pay_kit/protocols/mpp/server/session_method.py        377     43    89%   90-91, 201, 214, 276, 318, 326-327, 332, 346, 351, 384, 441-446, 458-459, 469-470, 478-479, 494-495, 535, 537, 549, 554, 558, 572, 579, 586, 614, 622, 641-646, 659, 666, 695
+src/solana_pay_kit/protocols/mpp/server/session_onchain.py       349     51    85%   170, 211, 254, 268, 284, 291, 305, 308, 310, 313, 316, 324, 360, 367, 384, 413, 418-419, 423, 462, 487-492, 545, 555, 558, 577, 581-582, 585, 599, 608, 637, 640-641, 654, 657, 754, 759, 776, 825-836
+src/solana_pay_kit/protocols/mpp/server/session_routes.py        105      4    96%   81, 90, 207-208
+src/solana_pay_kit/protocols/mpp/server/session_store.py         156     10    94%   69, 102, 120, 129, 301, 432, 438, 443, 448, 452
+src/solana_pay_kit/protocols/mpp/server/session_stream.py         50      0   100%
+src/solana_pay_kit/protocols/mpp/server/session_voucher.py       130     10    92%   344, 359, 364-365, 368-369, 372-373, 375, 395
+src/solana_pay_kit/protocols/programs/__init__.py                  0      0   100%
+src/solana_pay_kit/protocols/x402/__init__.py                    293     25    91%   187, 223-225, 259, 263-264, 365, 452, 469-470, 472, 486, 493, 503, 510, 513, 519, 527-534
+src/solana_pay_kit/protocols/x402/client/__init__.py               4      0   100%
+src/solana_pay_kit/protocols/x402/client/exact/__init__.py         4      0   100%
+src/solana_pay_kit/protocols/x402/client/exact/payment.py        276     11    96%   228, 234, 276, 282, 300, 312, 317, 323, 326-329, 479
+src/solana_pay_kit/protocols/x402/client/exact/transport.py       48      5    90%   73-74, 93-95
+src/solana_pay_kit/protocols/x402/client/upto/__init__.py          3      0   100%
+src/solana_pay_kit/protocols/x402/client/upto/payment.py         102     14    86%   65, 67, 69, 73, 75, 90-91, 95-96, 100, 107, 130, 134, 138
+src/solana_pay_kit/protocols/x402/exact/__init__.py                0      0   100%
+src/solana_pay_kit/protocols/x402/exact/extensions.py             60      0   100%
+src/solana_pay_kit/protocols/x402/exact/legacy.py                 27      0   100%
+src/solana_pay_kit/protocols/x402/exact/types.py                  45      0   100%
+src/solana_pay_kit/protocols/x402/exact/verify.py                154      4    97%   64, 240, 243, 312
+src/solana_pay_kit/protocols/x402/upto/__init__.py               335     40    88%   152, 181, 189-190, 270, 272, 330, 405, 475, 496-497, 499, 506, 509-515, 535-536, 555, 567, 569, 590-591, 594-595, 597, 628-631, 652-653, 655, 673, 689-690
+src/solana_pay_kit/protocols/x402/upto/types.py                   49      0   100%
+src/solana_pay_kit/protocols/x402/upto/verify.py                 156      8    95%   152, 158, 213, 216, 219, 299, 334, 358
+src/solana_pay_kit/signer.py                                      72      0   100%
+src/solana_pay_kit/usage.py                                       89     17    81%   147-148, 183-185, 188-197, 206-207
+--------------------------------------------------------------------------------------------
+TOTAL                                                           8709    784    91%
+Coverage JSON written to file /private/tmp/pay-kit-two-fix-backups/python/coverage.json
+Required test coverage of 90.0% reached. Total coverage: 91.00%
+1416 passed, 1 skipped, 4 warnings in 16.47s
